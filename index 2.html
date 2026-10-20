@@ -1,0 +1,247 @@
+<!doctype html><html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="apple-mobile-web-app-capable" content="yes"><title>Oda Piyanosu</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Mono:wght@500&display=swap">
+<style>
+/* Layout: full-screen live camera; objects found in view get neon frames; controls float on glass */
+:root{
+  --bg:#000; --glass:rgba(10,14,11,.6); --line:rgba(255,255,255,.18); --fg:#f2f5f0;
+  --neon:#39ff7a; --neon-soft:rgba(57,255,122,.45); --neon-dim:rgba(57,255,122,.6);
+  --display:"Bricolage Grotesque",ui-sans-serif,system-ui,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
+  color-scheme:dark;
+}
+html,body{height:100%;margin:0;overflow:hidden;overscroll-behavior:none}
+[hidden]{display:none!important}
+body{background:var(--bg);color:var(--fg);font-family:var(--display);-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+#stage{position:fixed;inset:0;overflow:hidden;touch-action:none;background:#000}
+#frame{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:100%;height:100%}
+#frame video{position:absolute;inset:0;width:100%;height:100%;object-fit:fill;display:block}
+#zones{position:absolute;inset:0}
+.z{position:absolute;border:2px solid var(--neon-dim);border-radius:10px;box-sizing:border-box;
+  box-shadow:0 0 10px var(--neon-soft),inset 0 0 10px var(--neon-soft);
+  transition:left .25s linear,top .25s linear,width .25s linear,height .25s linear,background .3s,box-shadow .3s}
+.z.manual{border-style:dashed}
+.z.hit{border-color:var(--neon);background:rgba(57,255,122,.3);box-shadow:0 0 30px var(--neon),0 0 64px var(--neon-soft),inset 0 0 20px var(--neon)}
+body.off .z:not(.hit){border-color:transparent;box-shadow:none}
+#tip{position:absolute;width:28px;height:28px;margin:-14px 0 0 -14px;border-radius:50%;border:3px solid var(--neon);box-shadow:0 0 16px var(--neon);pointer-events:none}
+#draft{position:absolute;border:2px dashed #fff;background:rgba(57,255,122,.15);pointer-events:none}
+.top{position:fixed;left:0;right:0;top:0;display:flex;gap:6px;align-items:center;overflow-x:auto;scrollbar-width:none;
+  padding-top:calc(env(safe-area-inset-top,0px) + 10px);padding-bottom:10px;
+  padding-left:max(12px,env(safe-area-inset-left,0px));padding-right:max(12px,env(safe-area-inset-right,0px))}
+.top::-webkit-scrollbar{display:none}
+.top>*{flex:none}
+#now{font-family:var(--mono);color:var(--neon);font-size:1rem;text-shadow:0 0 10px var(--neon);margin-left:auto;padding-left:8px;min-width:3ch;text-align:right;font-variant-numeric:tabular-nums}
+button{font:500 .85rem var(--display);color:var(--fg);background:var(--glass);border:1px solid var(--line);border-radius:999px;padding:8px 13px;
+  -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);white-space:nowrap;cursor:pointer}
+button.on{background:var(--neon);color:#04140a;border-color:var(--neon)}
+button:focus-visible{outline:2px solid var(--neon);outline-offset:2px}
+.bottom{position:fixed;left:0;right:0;bottom:0;display:flex;justify-content:flex-start;
+  padding-bottom:calc(env(safe-area-inset-bottom,0px) + 84px);
+  padding-left:max(12px,env(safe-area-inset-left,0px));padding-right:max(12px,env(safe-area-inset-right,0px));pointer-events:none}
+#msg{margin:0;font-size:.85rem;line-height:1.35;background:var(--glass);border-radius:10px;padding:8px 11px;max-width:32rem;
+  -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}
+#start{position:fixed;inset:0;display:grid;place-items:center;background:radial-gradient(120% 80% at 50% 40%,#0c1f13 0%,#000 70%);
+  padding-left:max(24px,env(safe-area-inset-left,0px));padding-right:max(24px,env(safe-area-inset-right,0px))}
+#start .card{display:flex;flex-direction:column;gap:14px;max-width:22rem;text-align:left}
+#start h1{margin:0;font-size:2rem;font-weight:700;letter-spacing:-.02em;text-wrap:balance}
+#start p{margin:0;color:#c6d3c8;line-height:1.45;font-size:.95rem}
+#start .keys{font-family:var(--mono);color:var(--neon);text-shadow:0 0 8px var(--neon-soft);font-size:.85rem;letter-spacing:.08em}
+#go{font-size:1.05rem;padding:14px 20px;align-self:flex-start;background:var(--neon);color:#04140a;border-color:var(--neon);box-shadow:0 0 24px var(--neon-soft)}
+#err{color:#ffb4a8}
+@media (prefers-reduced-motion:reduce){.z{transition:none}}
+</style></head><body>
+
+<div id="stage"><div id="frame">
+  <video id="video" playsinline muted autoplay></video>
+  <div id="zones"></div>
+  <div id="tip" hidden></div>
+  <div id="draft" hidden></div>
+</div></div>
+
+<div class="top" id="bar" hidden>
+  <button id="lock">Kilitle</button>
+  <button id="draw">Kutu çiz</button>
+  <button id="frames">Çerçeveleri gizle</button>
+  <button id="clear">Temizle</button>
+  <button id="stop">Kamerayı kapat</button>
+  <div id="now" aria-live="polite"></div>
+</div>
+<div class="bottom"><p id="msg" hidden></p></div>
+
+<div id="start"><div class="card">
+  <div class="keys">C · D · E · G · A</div>
+  <h1>Oda Piyanosu</h1>
+  <p>Kamerayı odaya tut. Uygulama gördüğü eşyaları bulur, her birine bir nota verir. Elini kameranın önüne uzatıp işaret parmağınla bir eşyayı gösterince o nota çalar.</p>
+  <button id="go">Kamerayı başlat</button>
+  <p id="err" hidden></p>
+</div></div>
+
+<script>
+// Pentatonic scale, low on the left of the view, high on the right
+const SCALE=["C3","D3","E3","G3","A3","C4","D4","E4","G4","A4","C5","D5","E5","G5","A5","C6"];
+const VB="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+const HAND_M="https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+const DET_M="https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite";
+const $=id=>document.getElementById(id);
+const v=$("video"),frame=$("frame"),zonesEl=$("zones");
+
+let objs=[],nextId=1,locked=false,drawing=false,camOn=false,stream=null,hand=null,det=null,raf=0,lastT=-1,lastDet=0,wake=null,msgTimer;
+const cur=new Map(),els=new Map();
+
+function say(t,ms){const m=$("msg");m.hidden=false;m.textContent=t;clearTimeout(msgTimer);if(ms)msgTimer=setTimeout(()=>{m.hidden=true},ms)}
+
+// ---------- audio ----------
+let ac;
+function audio(){
+  try{if(navigator.audioSession)navigator.audioSession.type="playback"}catch(e){} // lets sound play with the silent switch on (iOS 17+)
+  if(!ac)ac=new (window.AudioContext||window.webkitAudioContext)();
+  if(ac.state!=="running")ac.resume();
+  return ac}
+function freq(n){const m={C:0,D:2,E:4,F:5,G:7,A:9,B:11}[n[0]];const o=+n.slice(-1);return 440*Math.pow(2,(m+(o+1)*12-69)/12)}
+function play(note){
+  const c=audio(),t=c.currentTime,f=freq(note),out=c.createGain();
+  out.gain.setValueAtTime(0,t);out.gain.linearRampToValueAtTime(.3,t+.005);out.gain.exponentialRampToValueAtTime(.001,t+2.2);
+  const lp=c.createBiquadFilter();lp.type="lowpass";lp.frequency.setValueAtTime(Math.min(f*8,9000),t);lp.frequency.exponentialRampToValueAtTime(f*2,t+1.2);
+  out.connect(lp);lp.connect(c.destination);
+  [[1,1],[2,.45],[3,.2],[4,.1],[5,.05]].forEach(([h,a])=>{const o=c.createOscillator(),g=c.createGain();o.frequency.value=f*h;o.detune.value=(h-1)*2;
+    g.gain.setValueAtTime(a,t);g.gain.exponentialRampToValueAtTime(.0001,t+2.2/h);o.connect(g);g.connect(out);o.start(t);o.stop(t+2.3)});
+}
+
+// ---------- layout: video always covers the whole screen ----------
+let fitKey="";
+function fit(){
+  const vw=v.videoWidth,vh=v.videoHeight,W=innerWidth,H=innerHeight;if(!vw||!vh)return;
+  const k=vw+"x"+vh+"|"+W+"x"+H;if(k===fitKey)return;fitKey=k;
+  const ar=vw/vh;let w=W,h=W/ar;if(h<H){h=H;w=H*ar}
+  frame.style.width=w+"px";frame.style.height=h+"px";
+}
+addEventListener("resize",()=>{fitKey="";fit()});
+
+// ---------- objects ----------
+function iou(a,b){const x1=Math.max(a.x,b.x),y1=Math.max(a.y,b.y),x2=Math.min(a.x+a.w,b.x+b.w),y2=Math.min(a.y+a.h,b.y+b.h);
+  const i=Math.max(0,x2-x1)*Math.max(0,y2-y1);return i/(a.w*a.h+b.w*b.h-i||1)}
+function pickNote(cx){const used=new Set(objs.map(o=>o.note));const want=Math.round(Math.min(1,Math.max(0,cx))*(SCALE.length-1));
+  for(let d=0;d<SCALE.length;d++){for(const i of [want+d,want-d]){if(i>=0&&i<SCALE.length&&!used.has(SCALE[i]))return SCALE[i]}}return SCALE[want]}
+function addObj(b,manual){if(objs.length>=SCALE.length)return null;const o={id:nextId++,x:b.x,y:b.y,w:b.w,h:b.h,note:pickNote(b.x+b.w/2),seen:performance.now(),manual:!!manual};objs.push(o);return o}
+
+function ingest(dets,now){
+  const used=new Set();
+  dets.forEach(d=>{
+    let best=null,bi=.25;objs.forEach(o=>{if(used.has(o.id))return;const s=iou(o,d);if(s>bi){bi=s;best=o}});
+    if(best){used.add(best.id);best.seen=now;if(!best.manual){const k=.45;best.x+=(d.x-best.x)*k;best.y+=(d.y-best.y)*k;best.w+=(d.w-best.w)*k;best.h+=(d.h-best.h)*k}}
+    else{const o=addObj(d);if(o)used.add(o.id)}
+  });
+  // forget things that left the view; a hand covering an object should not erase it, so allow a grace period
+  objs=objs.filter(o=>o.manual||now-o.seen<2500);
+}
+
+function render(){
+  const alive=new Set();
+  objs.forEach(o=>{alive.add(o.id);let d=els.get(o.id);
+    if(!d){d=document.createElement("div");d.className="z"+(o.manual?" manual":"");zonesEl.append(d);els.set(o.id,d)}
+    d.style.left=o.x*100+"%";d.style.top=o.y*100+"%";d.style.width=o.w*100+"%";d.style.height=o.h*100+"%"});
+  els.forEach((d,id)=>{if(!alive.has(id)){d.remove();els.delete(id)}});
+}
+function hitAt(x,y){let best=null,area=9;objs.forEach(o=>{if(x>=o.x&&x<=o.x+o.w&&y>=o.y&&y<=o.y+o.h&&o.w*o.h<area){area=o.w*o.h;best=o}});return best}
+function flash(o){const d=els.get(o.id);if(d){d.classList.add("hit");clearTimeout(d._t);d._t=setTimeout(()=>d.classList.remove("hit"),280)}$("now").textContent=o.note}
+function point(key,x,y){const o=hitAt(x,y),id=o?o.id:0;if(id!==cur.get(key)){cur.set(key,id);if(o){play(o.note);flash(o)}}}
+
+// ---------- camera ----------
+async function openStream(){
+  if(stream)stream.getTracks().forEach(t=>t.stop());
+  stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:"environment"},width:{ideal:1920},height:{ideal:1080}}});
+  v.srcObject=stream;await v.play();fitKey="";fit();
+  const tr=stream.getVideoTracks()[0];tr.onended=()=>{if(camOn&&!document.hidden)resume()};
+}
+async function keepAwake(){try{if("wakeLock" in navigator&&!document.hidden)wake=await navigator.wakeLock.request("screen")}catch(e){}}
+
+async function makeTask(Ctor,fs,opts){
+  try{return await Ctor.createFromOptions(fs,{...opts,baseOptions:{...opts.baseOptions,delegate:"GPU"}})}
+  catch(e){return await Ctor.createFromOptions(fs,{...opts,baseOptions:{...opts.baseOptions,delegate:"CPU"}})}
+}
+async function loadModels(){
+  const V=await import(VB+"/vision_bundle.mjs");
+  const fs=await V.FilesetResolver.forVisionTasks(VB+"/wasm");
+  hand=await makeTask(V.HandLandmarker,fs,{baseOptions:{modelAssetPath:HAND_M},runningMode:"VIDEO",numHands:2});
+  det=await makeTask(V.ObjectDetector,fs,{baseOptions:{modelAssetPath:DET_M},runningMode:"VIDEO",scoreThreshold:.3,maxResults:12,categoryDenylist:["person"]});
+}
+
+$("go").onclick=async()=>{
+  audio();
+  $("go").disabled=true;$("go").textContent="Açılıyor…";$("err").hidden=true;
+  try{await openStream()}catch(e){
+    $("go").disabled=false;$("go").textContent="Kamerayı başlat";$("err").hidden=false;
+    $("err").textContent="Kamera açılamadı. Safari kamera iznini kontrol et (adres çubuğundaki aA › Web Sitesi Ayarları › Kamera › İzin Ver) ve tekrar dene.";return}
+  camOn=true;$("start").hidden=true;$("bar").hidden=false;keepAwake();
+  loop();
+  if(!det){say("Eşya ve el tanıma yükleniyor…");
+    try{await loadModels();say("Kamerayı odada gezdir. Eşyalar yeşil çerçeveyle işaretlenince elini uzatıp işaret parmağınla göster. Çerçeveler oynamasın istersen Kilitle'ye bas.",10000)}
+    catch(e){say("Tanıma yüklenemedi, internet bağlantını kontrol edip sayfayı yenile. Bu sırada Kutu çiz ile eşyaları elle işaretleyebilirsin.")}}
+};
+
+function loop(){
+  cancelAnimationFrame(raf);
+  const step=()=>{
+    if(!camOn)return;
+    fit();
+    if(v.readyState>=2&&v.currentTime!==lastT){
+      lastT=v.currentTime;const now=performance.now();
+      if(hand){
+        try{const r=hand.detectForVideo(v,now);const seen=new Set();
+          (r.landmarks||[]).forEach((lm,h)=>{const p=lm[8];const k="h"+h;seen.add(k);point(k,p.x,p.y);
+            if(h===0){const t=$("tip");t.hidden=false;t.style.left=p.x*100+"%";t.style.top=p.y*100+"%"}});
+          if(!seen.size)$("tip").hidden=true;["h0","h1"].forEach(k=>{if(!seen.has(k))cur.delete(k)});
+        }catch(e){}
+      }
+      if(det&&!locked&&now-lastDet>280){
+        lastDet=now;
+        try{const r=det.detectForVideo(v,now+.5);const W=v.videoWidth,H=v.videoHeight;
+          const d=(r.detections||[]).map(x=>({x:x.boundingBox.originX/W,y:x.boundingBox.originY/H,w:x.boundingBox.width/W,h:x.boundingBox.height/H}))
+            .filter(b=>b.w>.02&&b.h>.02&&b.w*b.h<.7);
+          ingest(d,now);render();
+        }catch(e){}
+      }
+    }
+    raf=requestAnimationFrame(step);
+  };
+  raf=requestAnimationFrame(step);
+}
+
+// Coming back from another app or the lock screen: iOS stops the camera, so restart it
+async function resume(){
+  if(!camOn)return;
+  const tr=stream&&stream.getVideoTracks()[0];
+  try{
+    if(!tr||tr.readyState==="ended"||tr.muted||v.paused)await openStream();
+    else await v.play();
+  }catch(e){try{await openStream()}catch(e2){say("Kamera yeniden açılamadı. Sayfayı yenile.");return}}
+  lastT=-1;fitKey="";loop();keepAwake();
+  if(ac&&ac.state!=="running")say("Sesi açmak için ekrana bir kez dokun.",5000);
+}
+document.addEventListener("visibilitychange",()=>{if(!document.hidden)resume()});
+addEventListener("pageshow",()=>resume());
+
+// ---------- buttons ----------
+$("lock").onclick=()=>{locked=!locked;$("lock").classList.toggle("on",locked);$("lock").textContent=locked?"Kilitli":"Kilitle";
+  say(locked?"Çerçeveler sabitlendi. Kamerayı oynatma, istediğin kadar çal.":"Eşyalar yeniden aranıyor.",3500)};
+$("draw").onclick=()=>{drawing=!drawing;$("draw").classList.toggle("on",drawing);$("draw").textContent=drawing?"Bitti":"Kutu çiz";
+  say(drawing?"Uygulamanın bulamadığı bir eşyanın etrafına parmağınla kutu çiz. Bu kutular kalıcıdır.":"Çizim bitti.",drawing?0:2000)};
+$("frames").onclick=()=>{const c=document.body.classList.toggle("off");$("frames").textContent=c?"Çerçeveleri göster":"Çerçeveleri gizle"};
+$("clear").onclick=()=>{objs=[];render();$("now").textContent="";say("Temizlendi. Eşyalar yeniden aranıyor.",2500);if(locked)$("lock").click()};
+$("stop").onclick=()=>{camOn=false;cancelAnimationFrame(raf);if(stream)stream.getTracks().forEach(t=>t.stop());stream=null;
+  try{wake&&wake.release()}catch(e){}$("bar").hidden=true;$("msg").hidden=true;$("start").hidden=false;$("go").disabled=false;$("go").textContent="Kamerayı başlat"};
+
+// ---------- touch: play by touching, or draw boxes ----------
+function rel(e){const r=frame.getBoundingClientRect();return[(e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height]}
+let drag=null;const stage=$("stage");
+stage.addEventListener("pointerdown",e=>{audio();try{stage.setPointerCapture(e.pointerId)}catch(_){}const[x,y]=rel(e);
+  if(drawing){drag={x0:x,y0:y};return}point("p"+e.pointerId,x,y)});
+stage.addEventListener("pointermove",e=>{const[x,y]=rel(e);
+  if(drawing&&drag){const d=$("draft");d.hidden=false;Object.assign(d.style,{left:Math.min(x,drag.x0)*100+"%",top:Math.min(y,drag.y0)*100+"%",width:Math.abs(x-drag.x0)*100+"%",height:Math.abs(y-drag.y0)*100+"%"});return}
+  if(!drawing&&e.buttons)point("p"+e.pointerId,x,y)});
+function endPtr(e){cur.delete("p"+e.pointerId);if(!drawing||!drag)return;const[x,y]=rel(e);$("draft").hidden=true;
+  const b={x:Math.min(x,drag.x0),y:Math.min(y,drag.y0),w:Math.abs(x-drag.x0),h:Math.abs(y-drag.y0)};drag=null;
+  if(b.w>.03&&b.h>.03){const o=addObj(b,true);if(o){render();play(o.note);flash(o)}}}
+stage.addEventListener("pointerup",endPtr);stage.addEventListener("pointercancel",endPtr);
+</script>
+</body></html>
