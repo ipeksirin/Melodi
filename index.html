@@ -125,6 +125,8 @@ input[type=range]{width:100%;accent-color:var(--neon)}
     <div class="seg" id="fingSeg"></div>
     <div class="lbl">Çalma şekli</div>
     <div class="seg" id="modeSeg"></div>
+    <div class="lbl">Ritme hizala (ritim açıkken)</div>
+    <div class="seg" id="quantSeg"></div>
     <div class="lbl">Nota dizilimi</div>
     <div class="seg" id="scaleSeg"></div>
     <div class="lbl">Ritim tarzı</div>
@@ -216,7 +218,7 @@ const VOICES={
   synth:{name:"Synth",play(c,t,f,out){const lp=c.createBiquadFilter();lp.type="lowpass";lp.Q.value=6;lp.frequency.setValueAtTime(f*14,t);lp.frequency.exponentialRampToValueAtTime(f*1.5,t+.6);lp.connect(out);
     partials(c,t,f,[[1,.22,1],[1.006,.22,1],[.5,.15,.8]],1.3,lp,"sawtooth")}}
 };
-function play(note){const c=audio(),t=c.currentTime+.005;const out=c.createGain();out.gain.value=.55;out.connect(master);VOICES[inst].play(c,t,freq(note),out);setTimeout(()=>out.disconnect(),4000)}
+function play(note,at){const c=audio(),t=Math.max(c.currentTime+.005,at||0);const out=c.createGain();out.gain.value=.55;out.connect(master);VOICES[inst].play(c,t,freq(note),out);setTimeout(()=>out.disconnect(),4000)}
 
 // ================= rhythm =================
 // 16 steps per bar. k=kick s=snare h=closed hat o=open hat c=clap r=rim z=shaker
@@ -252,7 +254,7 @@ function schedule(){const c=ac;const st=STYLES[styleKey];const sixteenth=60/bpm/
     if(i%4===0)pulse(t-c.currentTime);
     nextStepT+=sixteenth;stepN++}}
 function pulse(delay){setTimeout(()=>{const b=$("beat");if(beating){b.style.boxShadow="0 0 18px var(--neon)";setTimeout(()=>b.style.boxShadow="",90)}},Math.max(0,delay*1000))}
-function startBeat(){audio();beating=true;stepN=0;nextStepT=ac.currentTime+.06;clearInterval(beatTimer);beatTimer=setInterval(schedule,25);schedule();
+function startBeat(){audio();beating=true;stepN=0;nextStepT=ac.currentTime+.06;beatT0=nextStepT;clearInterval(beatTimer);beatTimer=setInterval(schedule,25);schedule();
   $("beat").classList.add("on");$("beat").textContent="■ Ritim"}
 function stopBeat(){beating=false;clearInterval(beatTimer);$("beat").classList.remove("on");$("beat").textContent="▶ Ritim"}
 
@@ -403,12 +405,18 @@ function render(){
   $("count").textContent=objs.length+" eşya";
 }
 function hitAt(x,y,pad){let best=null,ar=9;objs.forEach(o=>{if(inside(o,x,y,pad)&&oArea(o)<ar){ar=oArea(o);best=o}});return best}
+// Snap a hit to the rhythm grid: a hit just after a grid line plays at once, otherwise on the next line.
+// Detection is never instant, so this keeps notes on the beat even when the finger is seen a little late.
+let quant=store.get("quant","16");let beatT0=0;
+function hitTime(){if(!beating||quant==="off"||!ac)return 0;const q=60/bpm/(quant==="8"?2:4),now=ac.currentTime+.005;
+  const k=Math.ceil((now-beatT0)/q-.22);return Math.max(now,beatT0+k*q)}
+function strikeObj(o){const at=hitTime();play(o.note,at);const wait=at?Math.max(0,(at-ac.currentTime)*1000):0;if(wait>12)setTimeout(()=>flash(o),wait);else flash(o)}
 function flash(o){addWave(o);const d=els.get(o.id);if(d){d.classList.add("hit");clearTimeout(d._t);d._t=setTimeout(()=>d.classList.remove("hit"),300)}$("now").textContent=o.note}
 // hysteresis: stay on the current object until the tip clearly leaves it
 function point(key,x,y){
   const curId=cur.get(key),curObj=curId&&objs.find(o=>o.id===curId);
   if(curObj&&inside(curObj,x,y,true)){const inner=hitAt(x,y);if(!inner||inner.id===curId||oArea(inner)>oArea(curObj))return null}
-  const o=hitAt(x,y);const id=o?o.id:0;if(id!==curId){cur.set(key,id);if(o){play(o.note);flash(o);return o}}return null}
+  const o=hitAt(x,y);const id=o?o.id:0;if(id!==curId){cur.set(key,id);if(o){strikeObj(o);return o}}return null}
 
 // ---------- full scan ----------
 // One still frame, searched whole and in four overlapping tiles (small things show up better when zoomed in),
@@ -504,7 +512,7 @@ function onHands(landmarks,hands,now){
   const tips=[],ids=fingers==="all"?TIPS_ALL:TIPS_INDEX;
   landmarks.forEach((lm,h)=>{const side=hands[h]||("h"+h);
     ids.forEach(t=>{const k=side+t,p=lm[t],prev=tipPos.get(k);let s;
-      if(prev&&now-prev.t<250){const sp=Math.hypot(p.x-prev.x,p.y-prev.y),a=Math.min(1,.5+sp*30);
+      if(prev&&now-prev.t<250){const sp=Math.hypot(p.x-prev.x,p.y-prev.y),a=Math.min(1,.72+sp*40);
         s={x:prev.x+(p.x-prev.x)*a,y:prev.y+(p.y-prev.y)*a,t:now,vy:.6*(p.y-prev.y)/Math.max(.008,(now-prev.t)/1000)+.4*(prev.vy||0)}}
       else s={x:p.x,y:p.y,t:now,vy:0};
       tipPos.set(k,s);tips.push({k,x:s.x,y:s.y,vy:s.vy,idx:t===8})})});
@@ -515,7 +523,7 @@ function onHands(landmarks,hands,now){
     const st=strike.get(t.k)||{armed:true,last:0};if(enterHit)st.last=now;
     if(st.armed&&t.vy>.4){st.armed=false;const o=hitAt(t.x,t.y,true);
       // one stroke = one note: skip if this finger just sounded something
-      if(o&&now-st.last>200){play(o.note);flash(o);st.last=now}}
+      if(o&&now-st.last>200){strikeObj(o);st.last=now}}
     else if(!st.armed&&t.vy<.06)st.armed=true;
     strike.set(t.k,st)});
   drawTips(tips,now)}
@@ -641,7 +649,7 @@ $("objRemove").onclick=()=>{const o=objs.find(o=>o.id===selId);if(!o)return;
 
 Object.entries(VOICES).forEach(([k,vv])=>{const b=document.createElement("button");b.textContent=vv.name;b.dataset.k=k;b.onclick=()=>{inst=k;store.set("inst",k);segMark();play("E4")};$("instSeg").append(b)});
 [["index","İşaret parmakları"],["all","Tüm parmaklar"]].forEach(([k,n])=>{const b=document.createElement("button");b.textContent=n;b.dataset.f=k;b.onclick=()=>{fingers=k;store.set("fingers",k);segMark()};$("fingSeg").append(b)});
-function segMark(){[...$("modeSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.m===playMode));[...$("scaleSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.s===scaleKey));[...$("styleSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.st===styleKey));[...$("instSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.k===inst));[...$("fingSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.f===fingers))}
+function segMark(){[...$("quantSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.q===quant));[...$("modeSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.m===playMode));[...$("scaleSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.s===scaleKey));[...$("styleSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.st===styleKey));[...$("instSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.k===inst));[...$("fingSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.f===fingers))}
 segMark();
 $("beat").onclick=()=>{beating?stopBeat():startBeat()};
 $("scan").onclick=()=>{if(!det){say("Tanıma hâlâ yükleniyor, birkaç saniye sonra tekrar dene.",3000);return}scan()};
@@ -649,6 +657,7 @@ Object.entries(SCALES).forEach(([k,x])=>{const b=document.createElement("button"
   const S=curScale();[0,1,2].forEach((i,j)=>setTimeout(()=>play(S[3+i]),j*140))};$("scaleSeg").append(b)});
 Object.entries(STYLES).forEach(([k,x])=>{const b=document.createElement("button");b.textContent=x.name;b.dataset.st=k;b.onclick=()=>{styleKey=k;store.set("style",k);bpm=x.bpm;store.set("bpm",bpm);syncRanges();segMark();if(!beating)startBeat()};$("styleSeg").append(b)});
 function syncRanges(){$("tempo").value=bpm;$("tempoVal").textContent=bpm+" BPM";$("beatVol").value=beatVol;$("beatVolVal").textContent=beatVol+"%";$("padBtn").classList.toggle("on",padOn)}
+[["off","Kapalı"],["8","1/8"],["16","1/16"]].forEach(([k,n])=>{const b=document.createElement("button");b.textContent=n;b.dataset.q=k;b.onclick=()=>{quant=k;store.set("quant",k);segMark()};$("quantSeg").append(b)});
 [["both","Üstüne gelince + vuruş"],["enter","Sadece üstüne gelince"],["strike","Sadece vuruşla"]].forEach(([k,n])=>{const b=document.createElement("button");b.textContent=n;b.dataset.m=k;
   b.onclick=()=>{playMode=k;store.set("playMode",k);segMark()};$("modeSeg").append(b)});
 $("tempo").oninput=e=>{bpm=+e.target.value;store.set("bpm",bpm);syncRanges()};
