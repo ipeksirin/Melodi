@@ -112,15 +112,20 @@ input[type=range]{width:100%;accent-color:var(--neon)}
 
 <div class="bottom">
   <div class="sheet" id="objSheet" hidden>
-    <div class="row" style="justify-content:space-between"><h2>Bu eşya</h2><button id="objClose">Kapat</button></div>
+    <div class="row" style="justify-content:space-between"><h2 id="objTitle">Bu eşya</h2><button id="objClose">Kapat</button></div>
     <div class="lbl">Nota</div>
     <div class="notes" id="noteGrid"></div>
+    <div class="lbl">Ses</div>
+    <div class="seg" id="objVoice"></div>
     <div class="row"><button class="danger" id="objRemove">Bu eşyayı kaldır</button></div>
   </div>
   <div class="sheet" id="setSheet" hidden>
     <div class="row" style="justify-content:space-between"><h2>Ayarlar</h2><button id="setClose">Kapat</button></div>
+    <div class="lbl">Mod</div>
+    <div class="seg" id="modeSel"></div>
     <div class="lbl">Ses</div>
     <div class="seg" id="instSeg"></div>
+    <div class="seg"><button id="layerBtn">Manzarada her katman kendi sesiyle</button></div>
     <div class="lbl">Hangi parmaklar çalsın</div>
     <div class="seg" id="fingSeg"></div>
     <div class="lbl">Çalma şekli</div>
@@ -241,7 +246,7 @@ function pluck(c,f){const key=Math.round(f*100);if(pluckCache.has(key))return pl
   for(let i=0;i<len;i++){const nx=(p+1)%N,v=(ring[p]+ring[nx])*.5*damp;d[i]=ring[p];ring[p]=v*.7+last*.3;last=v;p=nx}
   pluckCache.set(key,buf);return buf}
 let _drive=null;function driveCurve(){if(_drive)return _drive;const n=1024,cv=new Float32Array(n);for(let i=0;i<n;i++){const x=i/(n-1)*2-1;cv[i]=Math.tanh(x*2.6)/Math.tanh(2.6)}return _drive=cv}
-function play(note,at){const c=audio(),t=Math.max(c.currentTime+.005,at||0);const out=c.createGain();out.gain.value=.55;out.connect(master);VOICES[inst].play(c,t,freq(note),out);setTimeout(()=>out.disconnect(),4000)}
+function play(note,at,voice){const c=audio(),t=Math.max(c.currentTime+.005,at||0);const out=c.createGain();out.gain.value=.55;out.connect(master);VOICES[(voice&&VOICES[voice])?voice:inst].play(c,t,freq(note),out);setTimeout(()=>out.disconnect(),4000)}
 
 // ================= rhythm =================
 // 16 steps per bar. k=kick s=snare h=closed hat o=open hat c=clap r=rim z=shaker
@@ -314,6 +319,102 @@ function drawWaves(ctx,ox,oy,fw,fh,now){
 }
 function fxFrame(now){fxc.clearRect(0,0,fxW,fxH);drawShapes(fxc,0,0,fxW,fxH);if(!waves.length)return;waves=waves.filter(w=>now-w.born<w.dur);drawWaves(fxc,0,0,fxW,fxH,now)}
 
+// ================= scene mode =================
+// ================= landscape mode: split a view into sky, sea, greenery, hills/islands, buildings =================
+// No outdoor-aware model runs in the browser, so this reads the picture itself: colour, texture and where things sit
+// relative to the sky. Similar neighbouring pixels are grouped into regions; each region becomes a playable layer.
+const KINDS={
+  sky:{name:"Gökyüzü",voice:"bell",rgb:[95,243,240]},
+  sea:{name:"Deniz",voice:"hang",rgb:[80,150,255]},
+  hill:{name:"Dağ / Ada",voice:"piano",rgb:[178,120,255]},
+  green:{name:"Yeşillik",voice:"marimba",rgb:[57,255,122]},
+  build:{name:"Bina / Çatı",voice:"guitar",rgb:[255,120,200]},
+  other:{name:"Yüzey",voice:"piano",rgb:[255,214,102]}
+};
+function sceneRegions(src){
+  const SW=src.width,SH=src.height,sc=128/Math.max(SW,SH),w=Math.max(8,Math.round(SW*sc)),h=Math.max(8,Math.round(SH*sc)),N=w*h;
+  const cv=document.createElement("canvas");cv.width=w;cv.height=h;const cx=cv.getContext("2d");cx.drawImage(src,0,0,w,h);
+  const px=cx.getImageData(0,0,w,h).data;
+  // --- colour to Lab ---
+  const L=new Float32Array(N),A=new Float32Array(N),B=new Float32Array(N);
+  const lin=c=>{c/=255;return c<=.04045?c/12.92:Math.pow((c+.055)/1.055,2.4)},fl=t=>t>.008856?Math.cbrt(t):7.787*t+16/116;
+  for(let i=0;i<N;i++){const r=lin(px[i*4]),g=lin(px[i*4+1]),b=lin(px[i*4+2]);
+    const X=(r*.4124+g*.3576+b*.1805)/.9505,Y=r*.2126+g*.7152+b*.0722,Z=(r*.0193+g*.1192+b*.9505)/1.089;
+    const fx=fl(X),fy=fl(Y),fz=fl(Z);L[i]=116*fy-16;A[i]=500*(fx-fy);B[i]=200*(fy-fz)}
+  // --- texture: local detail (gradient of lightness, averaged) ---
+  const G=new Float32Array(N),T=new Float32Array(N);
+  for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){const i=y*w+x;G[i]=Math.abs(L[i+1]-L[i-1])+Math.abs(L[i+w]-L[i-w])}
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){let s=0,n=0;for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++){const xx=x+dx,yy=y+dy;if(xx>=0&&yy>=0&&xx<w&&yy<h){s+=G[yy*w+xx];n++}}T[y*w+x]=s/n}
+  const sortedT=Float32Array.from(T).sort(),medT=Math.max(1,sortedT[N>>1]);
+  // --- which edge is "up"? the sky side: bright, smooth, blue-white ---
+  const band=(f)=>{let s=0,n=0;for(let y=0;y<h;y++)for(let x=0;x<w;x++)if(f(x,y)){const i=y*w+x;s+=L[i]-1.6*T[i]-.6*Math.max(0,B[i])-.5*Math.abs(A[i]);n++}return s/Math.max(1,n)};
+  const bw=Math.max(2,Math.round(w*.12)),bh=Math.max(2,Math.round(h*.12));
+  const edges=[["top",band((x,y)=>y<bh)],["bottom",band((x,y)=>y>=h-bh)],["left",band((x,y)=>x<bw)],["right",band((x,y)=>x>=w-bw)]].sort((p,q)=>q[1]-p[1]);
+  const up=edges[0][0];
+  const U=(x,y)=>up==="top"?y/(h-1):up==="bottom"?1-y/(h-1):up==="left"?x/(w-1):1-x/(w-1); // 0 = at the sky edge
+  // --- layer by layer: sky, then water, then hills/islands, then everything else grouped by colour ---
+  const reg=new Int32Array(N).fill(-1),nb=(p,fn)=>{const x=p%w,y=(p/w)|0;if(x>0)fn(p-1);if(x<w-1)fn(p+1);if(y>0)fn(p-w);if(y<h-1)fn(p+w)};
+  const dE=(i,l,a,b)=>Math.hypot(L[i]-l,A[i]-a,B[i]-b);
+  // region growing from seeds; pixels join while smooth and close in colour to both their neighbour and the region's average
+  function grow(seeds,id,tex,dAvg,dLoc){let sl=0,sa=0,sb=0,n=0;const st=[];
+    for(const p of seeds)if(reg[p]<0){reg[p]=id;st.push(p);sl+=L[p];sa+=A[p];sb+=B[p];n++}
+    while(st.length){const p=st.pop();nb(p,q=>{if(reg[q]>=0||T[q]>tex)return;
+      if(dE(q,sl/n,sa/n,sb/n)>dAvg||dE(q,L[p],A[p],B[p])>dLoc)return;reg[q]=id;st.push(q);sl+=L[q];sa+=A[q];sb+=B[q];n++})}
+    return n}
+  let R=0;const kind=new Map();
+  // sky: from the sky edge
+  const skySeeds=[];for(let y=0;y<h;y++)for(let x=0;x<w;x++){const i=y*w+x;if(U(x,y)<.04&&T[i]<medT*.9&&L[i]>40)skySeeds.push(i)}
+  if(skySeeds.length>w*.15){const n=grow(skySeeds,R,medT*1.1,16,4.5);if(n>N*.02){kind.set(R,"sky");R++}else for(let i=0;i<N;i++)if(reg[i]===R)reg[i]=-1}
+  // water: the largest smooth, bluish area that is not sky
+  {const cand=[];for(let i=0;i<N;i++)if(reg[i]<0&&T[i]<medT*.7&&B[i]<4&&L[i]>28)cand.push(i);
+    const seen=new Uint8Array(N),cand1=new Uint8Array(N);cand.forEach(i=>cand1[i]=1);let best=[];
+    for(const i of cand){if(seen[i])continue;const comp=[],st=[i];seen[i]=1;while(st.length){const p=st.pop();comp.push(p);nb(p,q=>{if(cand1[q]&&!seen[q]){seen[q]=1;st.push(q)}})}if(comp.length>best.length)best=comp}
+    if(best.length>N*.03){const n=grow(best,R,medT*.85,13,4);if(n>N*.03){kind.set(R,"sea");R++}else for(let i=0;i<N;i++)if(reg[i]===R)reg[i]=-1}}
+  // hills and islands: smooth leftovers that touch the sky or sit inside the water
+  {const skyId=[...kind].find(([k,v])=>v==="sky"),seaId=[...kind].find(([k,v])=>v==="sea");const seen=new Uint8Array(N);
+    for(let i=0;i<N;i++){if(reg[i]>=0||seen[i]||T[i]>medT*.85)continue;const comp=[],st=[i];seen[i]=1;let tSky=0,tSea=0,tOther=0;
+      while(st.length){const p=st.pop();comp.push(p);nb(p,q=>{if(reg[q]<0){if(!seen[q]&&T[q]<=medT*.85){seen[q]=1;st.push(q)}else if(T[q]>medT*.85)tOther++}
+        else if(skyId&&reg[q]===skyId[0])tSky++;else if(seaId&&reg[q]===seaId[0])tSea++})}
+      if(comp.length>N*.01&&(tSky+tSea)>tOther*.6){comp.forEach(p=>reg[p]=R);kind.set(R,"hill");R++}}}
+  // the rest: group by colour and texture, then split into connected pieces
+  const rest=[];for(let i=0;i<N;i++)if(reg[i]<0)rest.push(i);
+  if(rest.length){const K=Math.min(7,Math.max(2,Math.round(rest.length/N*10))),F=6,feat=new Float32Array(rest.length*F);
+    rest.forEach((i,j)=>{const x=i%w,y=(i/w)|0,o=j*F;feat[o]=L[i]/100;feat[o+1]=A[i]/35;feat[o+2]=B[i]/40;feat[o+3]=Math.min(3,T[i]/medT)*.25;feat[o+4]=x/w*.25;feat[o+5]=y/h*.25});
+    const M=rest.length,C=new Float32Array(K*F);let seed=7;const rnd=()=>(seed=(seed*16807)%2147483647)/2147483647;
+    const d2=(j,k)=>{let s=0;for(let f=0;f<F;f++){const d=feat[j*F+f]-C[k*F+f];s+=d*d}return s};
+    {const D=new Float32Array(M).fill(1e9);let first=Math.floor(rnd()*M);for(let f=0;f<F;f++)C[f]=feat[first*F+f];
+      for(let k=1;k<K;k++){let tot=0;for(let j=0;j<M;j++){D[j]=Math.min(D[j],d2(j,k-1));tot+=D[j]}let r=rnd()*tot,pick=0;for(let j=0;j<M;j++){r-=D[j];if(r<=0){pick=j;break}}for(let f=0;f<F;f++)C[k*F+f]=feat[pick*F+f]}}
+    const lab=new Int32Array(M);for(let it=0;it<10;it++){const S=new Float32Array(K*F),cnt=new Int32Array(K);
+      for(let j=0;j<M;j++){let bk=0,bd=1e9;for(let k=0;k<K;k++){const d=d2(j,k);if(d<bd){bd=d;bk=k}}lab[j]=bk;cnt[bk]++;for(let f=0;f<F;f++)S[bk*F+f]+=feat[j*F+f]}
+      for(let k=0;k<K;k++)if(cnt[k])for(let f=0;f<F;f++)C[k*F+f]=S[k*F+f]/cnt[k]}
+    const cl=new Int32Array(N).fill(-1);rest.forEach((i,j)=>cl[i]=lab[j]);
+    for(const i of rest){if(reg[i]>=0)continue;const st=[i];reg[i]=R;while(st.length){const p=st.pop();nb(p,q=>{if(reg[q]<0&&cl[q]===cl[i]){reg[q]=R;st.push(q)}})}R++}}
+  const isLand=id=>!kind.has(id)||kind.get(id)==="land";
+  const stats=()=>{const s=new Map();for(let i=0;i<N;i++){const r=reg[i];let o=s.get(r);if(!o){o={id:r,n:0,L:0,A:0,B:0,T:0,U:0,x0:w,y0:h,x1:0,y1:0};s.set(r,o)}
+      const x=i%w,y=(i/w)|0;o.n++;o.L+=L[i];o.A+=A[i];o.B+=B[i];o.T+=T[i];o.U+=U(x,y);if(x<o.x0)o.x0=x;if(x>o.x1)o.x1=x;if(y<o.y0)o.y0=y;if(y>o.y1)o.y1=y}
+    s.forEach(o=>{o.L/=o.n;o.A/=o.n;o.B/=o.n;o.T/=o.n*medT;o.U/=o.n});return s};
+  const merge=(a,b)=>{for(let i=0;i<N;i++)if(reg[i]===a)reg[i]=b};
+  const border=(r)=>{const m=new Map();for(let i=0;i<N;i++){if(reg[i]!==r)continue;nb(i,q=>{if(reg[q]!==r)m.set(reg[q],(m.get(reg[q])||0)+1)})}return m};
+  // fold specks of land into their neighbour
+  for(let pass=0;pass<5;pass++){const s=stats();const small=[...s.values()].filter(o=>o.n<N*.012&&isLand(o.id)).sort((a,b)=>a.n-b.n);if(!small.length)break;
+    for(const o of small){const b=border(o.id);let best=-1,bn=0;b.forEach((n,k)=>{if(n>bn&&(isLand(k)||kind.get(k)==="hill")){bn=n;best=k}});if(best<0)b.forEach((n,k)=>{if(n>bn){bn=n;best=k}});if(best>=0)merge(o.id,best)}}
+  // name the land
+  let s=stats();s.forEach(o=>{if(kind.has(o.id))return;kind.set(o.id,o.A<-6&&o.B>3?"green":(o.T>.95||o.A>6)?"build":"other")});
+  // join touching land pieces of the same kind when their colours are close
+  for(let g=0,changed=true;changed&&g<30;g++){changed=false;s=stats();
+    for(const o of s.values()){const ko=kind.get(o.id);if(!["green","build","other"].includes(ko))continue;
+      for(const [k] of border(o.id)){const p=s.get(k);if(p&&kind.get(k)===ko&&Math.hypot(p.L-o.L,p.A-o.A,p.B-o.B)<(ko==="green"?16:7)){merge(o.id,k);changed=true;break}}
+      if(changed)break}}
+  s=stats();while(s.size>14){const o=[...s.values()].sort((a,b)=>a.n-b.n)[0];const b=border(o.id);let best=-1,bn=0;b.forEach((n,k)=>{if(n>bn){bn=n;best=k}});if(best<0)break;merge(o.id,best);s=stats()}
+  const kindOf=o=>"other";
+  // --- output: box + silhouette per region, in the same shape the object code uses ---
+  const out=[];s.forEach(o=>{if(o.n<N*.008)return;const bw2=o.x1-o.x0+1,bh2=o.y1-o.y0+1,mw=bw2,mh=bh2,data=new Uint8Array(mw*mh);let on=0;
+    for(let y=0;y<mh;y++)for(let x=0;x<mw;x++){const v=reg[(o.y0+y)*w+o.x0+x]===o.id?1:0;data[y*mw+x]=v;on+=v}
+    out.push({box:{x:o.x0/w,y:o.y0/h,w:bw2/w,h:bh2/h},mask:{w:mw,h:mh,data,fill:on/(mw*mh)},kind:kind.get(o.id)||kindOf(o),height:1-o.U,area:o.n/N})});
+  return{regions:out,up}}
+
+let sceneMode=store.get("mode","home"),layerVoices=store.get("layerVoices",true);
+
 // ================= objects =================
 // Each object has a screen box (x,y,w,h, 0–1 of the camera frame). When the outline model found its exact shape,
 // it also has `mask` (the object's silhouette inside the box) and `raw` (the detector's looser box, used for tracking).
@@ -325,7 +426,8 @@ const centerIn=(a,b)=>{const cx=a.x+a.w/2,cy=a.y+a.h/2;return cx>b.x&&cx<b.x+b.w
 const track=o=>o.raw||o;
 function pickNote(cx){const S=curScale(),used=new Set(objs.map(o=>o.note));const want=Math.round(Math.min(1,Math.max(0,cx))*(S.length-1));
   for(let d=0;d<=2;d++)for(const i of [want+d,want-d])if(i>=0&&i<S.length&&!used.has(S[i]))return S[i];return S[want]}
-function reassign(){const order=[...objs].sort((a,b)=>(a.x+a.w/2)-(b.x+b.w/2));objs.forEach(o=>o.note=null);order.forEach(o=>o.note=pickNote(o.x+o.w/2));render()}
+const pitchPos=o=>o.height!=null?o.height:o.x+o.w/2;
+function reassign(){const order=[...objs].sort((a,b)=>pitchPos(a)-pitchPos(b));objs.forEach(o=>o.note=null);order.forEach(o=>o.note=pickNote(pitchPos(o)));render()}
 function addObj(b,manual){if(objs.length>=24)return null;const o={id:nextId++,x:b.x,y:b.y,w:b.w,h:b.h,raw:null,mask:null,note:pickNote(b.x+b.w/2),seen:performance.now(),manual:!!manual};objs.push(o);return o}
 
 function clean(dets){
@@ -407,9 +509,10 @@ function sprites(o,targetW){const m=o.mask;
     const s0=mid(0);g.moveTo(s0[0],s0[1]);for(let i=1;i<=n;i++){const c=P(i),e=mid(i);g.quadraticCurveTo(c[0]*sp+PAD,c[1]*sp+PAD,e[0],e[1])}g.closePath()};
   const mk=hit=>{const c=document.createElement("canvas");c.width=Math.ceil(m.w*sp+PAD*2);c.height=Math.ceil(m.h*sp+PAD*2);const g=c.getContext("2d");
     g.lineJoin="round";path(g);
-    if(hit){g.fillStyle="rgba(57,255,122,.3)";g.fill()}
-    g.shadowColor="#39ff7a";g.shadowBlur=(hit?24:11)*dpr;g.strokeStyle=hit?"#7dffa6":"#39ff7a";g.lineWidth=(hit?3:2)*dpr;
-    g.stroke();if(hit)g.stroke();g.shadowBlur=0;g.lineWidth=(hit?1.4:.8)*dpr;g.strokeStyle="rgba(190,255,210,.7)";g.stroke();return c};
+    const [r0,g0,b0]=o.rgb||[57,255,122],col=`rgb(${r0},${g0},${b0})`,lite=`rgba(${Math.round(r0+(255-r0)*.6)},${Math.round(g0+(255-g0)*.6)},${Math.round(b0+(255-b0)*.6)},.75)`;
+    if(hit){g.fillStyle=`rgba(${r0},${g0},${b0},.3)`;g.fill()}
+    g.shadowColor=col;g.shadowBlur=(hit?24:11)*dpr;g.strokeStyle=col;g.lineWidth=(hit?3:2)*dpr;
+    g.stroke();if(hit)g.stroke();g.shadowBlur=0;g.lineWidth=(hit?1.4:.8)*dpr;g.strokeStyle=lite;g.stroke();return c};
   o.sprite={idle:mk(false),hit:mk(true),sp,tw:targetW};return o.sprite}
 // draws outlined objects into ctx; (ox,oy,fw,fh) is where the camera frame sits in that ctx
 function drawShapes(ctx,ox,oy,fw,fh){const off=document.body.classList.contains("off");
@@ -422,7 +525,7 @@ function render(){
   objs.forEach(o=>{alive.add(o.id);let d=els.get(o.id);
     if(!d){d=document.createElement("div");d.innerHTML="<b></b>";zonesEl.append(d);els.set(o.id,d)}
     d.className="z"+(o.manual&&!o.mask?" manual":"")+(o.mask?" shape":"")+(o.id===selId?" sel":"")+(d.classList.contains("hit")?" hit":"");
-    d.firstChild.textContent=o.note;
+    d.firstChild.textContent=(editing&&o.label?o.label+" · ":"")+o.note;
     d.style.left=o.x*100+"%";d.style.top=o.y*100+"%";d.style.width=o.w*100+"%";d.style.height=o.h*100+"%"});
   els.forEach((d,id)=>{if(!alive.has(id)){d.remove();els.delete(id)}});
   $("count").textContent=objs.length+" eşya";
@@ -433,7 +536,8 @@ function hitAt(x,y,pad){let best=null,ar=9;objs.forEach(o=>{if(inside(o,x,y,pad)
 let quant=store.get("quant","16");let beatT0=0;
 function hitTime(){if(!beating||quant==="off"||!ac)return 0;const q=60/bpm/(quant==="8"?2:4),now=ac.currentTime+.005;
   const k=Math.ceil((now-beatT0)/q-.22);return Math.max(now,beatT0+k*q)}
-function strikeObj(o){const at=hitTime();play(o.note,at);const wait=at?Math.max(0,(at-ac.currentTime)*1000):0;if(wait>12)setTimeout(()=>flash(o),wait);else flash(o)}
+const voiceOf=o=>o.voiceSet||(layerVoices&&o.voice)||null;
+function strikeObj(o){const at=hitTime();play(o.note,at,voiceOf(o));const wait=at?Math.max(0,(at-ac.currentTime)*1000):0;if(wait>12)setTimeout(()=>flash(o),wait);else flash(o)}
 function flash(o){addWave(o);const d=els.get(o.id);if(d){d.classList.add("hit");clearTimeout(d._t);d._t=setTimeout(()=>d.classList.remove("hit"),300)}$("now").textContent=o.note}
 // hysteresis: stay on the current object until the tip clearly leaves it
 function point(key,x,y){
@@ -448,7 +552,18 @@ const snap=document.createElement("canvas"),tile=document.createElement("canvas"
 function detectIn(src){try{const r=det.detect(src),W=src.width,H=src.height;
   return (r.detections||[]).map(x=>({x:x.boundingBox.originX/W,y:x.boundingBox.originY/H,w:x.boundingBox.width/W,h:x.boundingBox.height/H,s:(x.categories[0]||{}).score||0}))}catch(e){return[]}}
 const tick=()=>new Promise(r=>setTimeout(r,16));
+async function sceneScan(){
+  if(scanning||!v.videoWidth)return;scanning=true;$("scan").classList.add("busy");$("scan").textContent="Taranıyor…";closeSheets();say("Manzara taranıyor. Telefonu sabit tut.");await tick();
+  const vw=v.videoWidth,vh=v.videoHeight;snap.width=640;snap.height=Math.round(640*vh/vw);snap.getContext("2d").drawImage(v,0,0,snap.width,snap.height);
+  let res;try{res=sceneRegions(snap)}catch(e){res={regions:[]}}
+  objs=objs.filter(o=>o.manual);
+  res.regions.sort((a,b)=>b.area-a.area).forEach(r=>{const o=addObj(r.box);if(!o)return;const K=KINDS[r.kind]||KINDS.other;
+    Object.assign(o,{mask:r.mask,kind:r.kind,label:K.name,rgb:K.rgb,voice:K.voice,height:r.height,seen:performance.now()})});
+  reassign();scanning=false;$("scan").classList.remove("busy");$("scan").textContent="Tara";if(!locked)$("lock").click();
+  const names=[...new Set(objs.filter(o=>o.kind).map(o=>o.label))];
+  say(objs.length?`${objs.length} katman bulundu: ${names.join(", ")}. Ufka yakın olanlar tiz, sana yakın olanlar pes çalar.`:"Bu görüntüde katman ayıramadım. Daha geniş bir manzara dene.",8000)}
 async function scan(){
+  if(sceneMode==="land")return sceneScan();
   if(!det||scanning||!v.videoWidth)return;scanning=true;$("scan").classList.add("busy");$("scan").textContent="Taranıyor…";closeSheets();
   const vw=v.videoWidth,vh=v.videoHeight;snap.width=1280;snap.height=Math.round(1280*vh/vw);snap.getContext("2d").drawImage(v,0,0,snap.width,snap.height);
   say("Taranıyor. Telefonu sabit tut.");await tick();
@@ -572,7 +687,7 @@ function loop(){
         onHands((r.landmarks||[]),((r.handednesses||r.handedness||[]).map(h=>(h[0]||{}).categoryName||"")),now);
       }catch(e){}}
       // pause object updates while a hand is in view, so a covered object is not lost or moved
-      if(det&&!scanning&&!locked&&!editing&&now-lastHand>1500&&now-lastDet>(beating?1500:600)){
+      if(det&&sceneMode==="home"&&!scanning&&!locked&&!editing&&now-lastHand>1500&&now-lastDet>(beating?1500:600)){
         lastDet=now;
         try{const src=procFrame();ingest(nms(detectIn(src),.45),now);
           const next=seg&&objs.find(o=>!o.mask&&!o.segTried&&!o.manual);if(next)refine(next,src);
@@ -666,16 +781,18 @@ $("setClose").onclick=closeSheets;$("objClose").onclick=closeSheets;
 function buildNoteGrid(){$("noteGrid").innerHTML="";curScale().forEach(n=>{const b=document.createElement("button");b.textContent=n;b.onclick=()=>{const o=objs.find(o=>o.id===selId);if(!o)return;
   const other=objs.find(x=>x!==o&&x.note===n);if(other)other.note=o.note; // swap so notes stay unique
   o.note=n;play(n);render();markNote()};$("noteGrid").append(b)})}
-function markNote(){if(!$("noteGrid").children.length)buildNoteGrid();const o=objs.find(o=>o.id===selId);[...$("noteGrid").children].forEach(b=>b.classList.toggle("on",!!o&&b.textContent===o.note))}
+function markVoice(){const o=objs.find(o=>o.id===selId);if(!o)return;$("objTitle").textContent=o.label||"Bu eşya";const cur=o.voiceSet||(layerVoices&&o.voice)||"";
+  [...$("objVoice").children].forEach(b=>b.classList.toggle("on",b.dataset.v===(o.voiceSet||"")))}
+function markNote(){markVoice();if(!$("noteGrid").children.length)buildNoteGrid();const o=objs.find(o=>o.id===selId);[...$("noteGrid").children].forEach(b=>b.classList.toggle("on",!!o&&b.textContent===o.note))}
 $("objRemove").onclick=()=>{const o=objs.find(o=>o.id===selId);if(!o)return;
   if(!o.manual){const b=track(o);ignored.push({x:b.x,y:b.y,w:b.w,h:b.h})}objs=objs.filter(x=>x!==o);closeSheets();say("Kaldırıldı.",1800)};
 
 Object.entries(VOICES).forEach(([k,vv])=>{const b=document.createElement("button");b.textContent=vv.name;b.dataset.k=k;b.onclick=()=>{inst=k;store.set("inst",k);segMark();play("E4")};$("instSeg").append(b)});
 [["index","İşaret parmakları"],["all","Tüm parmaklar"]].forEach(([k,n])=>{const b=document.createElement("button");b.textContent=n;b.dataset.f=k;b.onclick=()=>{fingers=k;store.set("fingers",k);segMark()};$("fingSeg").append(b)});
-function segMark(){[...$("quantSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.q===quant));[...$("modeSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.m===playMode));[...$("scaleSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.s===scaleKey));[...$("styleSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.st===styleKey));[...$("instSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.k===inst));[...$("fingSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.f===fingers))}
+function segMark(){[...$("modeSel").children].forEach(b=>b.classList.toggle("on",b.dataset.md===sceneMode));$("layerBtn").classList.toggle("on",layerVoices);[...$("quantSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.q===quant));[...$("modeSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.m===playMode));[...$("scaleSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.s===scaleKey));[...$("styleSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.st===styleKey));[...$("instSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.k===inst));[...$("fingSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.f===fingers))}
 segMark();
 $("beat").onclick=()=>{beating?stopBeat():startBeat()};
-$("scan").onclick=()=>{if(!det){say("Tanıma hâlâ yükleniyor, birkaç saniye sonra tekrar dene.",3000);return}scan()};
+$("scan").onclick=()=>{if(sceneMode==="land"){scan();return}if(!det){say("Tanıma hâlâ yükleniyor, birkaç saniye sonra tekrar dene.",3000);return}scan()};
 Object.entries(SCALES).forEach(([k,x])=>{const b=document.createElement("button");b.textContent=x.name;b.dataset.s=k;b.onclick=()=>{scaleKey=k;store.set("scale",k);reassign();buildNoteGrid();segMark();
   const S=curScale();[0,1,2].forEach((i,j)=>setTimeout(()=>play(S[3+i]),j*140))};$("scaleSeg").append(b)});
 Object.entries(STYLES).forEach(([k,x])=>{const b=document.createElement("button");b.textContent=x.name;b.dataset.st=k;b.onclick=()=>{styleKey=k;store.set("style",k);bpm=x.bpm;store.set("bpm",bpm);syncRanges();segMark();if(!beating)startBeat()};$("styleSeg").append(b)});
@@ -683,6 +800,12 @@ function syncRanges(){$("tempo").value=bpm;$("tempoVal").textContent=bpm+" BPM";
 [["off","Kapalı"],["8","1/8"],["16","1/16"]].forEach(([k,n])=>{const b=document.createElement("button");b.textContent=n;b.dataset.q=k;b.onclick=()=>{quant=k;store.set("quant",k);segMark()};$("quantSeg").append(b)});
 [["both","Üstüne gelince + vuruş"],["enter","Sadece üstüne gelince"],["strike","Sadece vuruşla"]].forEach(([k,n])=>{const b=document.createElement("button");b.textContent=n;b.dataset.m=k;
   b.onclick=()=>{playMode=k;store.set("playMode",k);segMark()};$("modeSeg").append(b)});
+[["home","Ev eşyaları"],["land","Manzara"]].forEach(([k,n])=>{const b=document.createElement("button");b.textContent=n;b.dataset.md=k;b.onclick=()=>{if(sceneMode===k)return;sceneMode=k;store.set("mode",k);
+  objs=[];ignored=[];render();if(locked)$("lock").click();segMark();closeSheets();
+  say(k==="land"?"Manzara modu: telefonu sabitle, gökyüzü ufukta görünsün ve Tara'ya bas.":"Ev modu: eşyalara tut ve Tara'ya bas.",6000)};$("modeSel").append(b)});
+$("layerBtn").onclick=()=>{layerVoices=!layerVoices;store.set("layerVoices",layerVoices);segMark()};
+[["","Genel ses"],...Object.entries(VOICES).map(([k,v])=>[k,v.name])].forEach(([k,n])=>{const b=document.createElement("button");b.textContent=n;b.dataset.v=k;
+  b.onclick=()=>{const o=objs.find(o=>o.id===selId);if(!o)return;o.voiceSet=k||null;markVoice();play(o.note,0,voiceOf(o))};$("objVoice").append(b)});
 $("tempo").oninput=e=>{bpm=+e.target.value;store.set("bpm",bpm);syncRanges()};
 $("beatVol").oninput=e=>{beatVol=+e.target.value;store.set("beatVol",beatVol);if(beatBus)beatBus.gain.value=beatVol/100;syncRanges()};
 $("padBtn").onclick=()=>{padOn=!padOn;store.set("pad",padOn);syncRanges()};
