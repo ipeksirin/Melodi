@@ -123,6 +123,8 @@ input[type=range]{width:100%;accent-color:var(--neon)}
     <div class="seg" id="instSeg"></div>
     <div class="lbl">Hangi parmaklar çalsın</div>
     <div class="seg" id="fingSeg"></div>
+    <div class="lbl">Çalma şekli</div>
+    <div class="seg" id="modeSeg"></div>
     <div class="lbl">Nota dizilimi</div>
     <div class="seg" id="scaleSeg"></div>
     <div class="lbl">Ritim tarzı</div>
@@ -134,6 +136,8 @@ input[type=range]{width:100%;accent-color:var(--neon)}
     <div class="seg"><button id="padBtn">Zemin pad sesi</button></div>
     <div class="lbl">Görünüm</div>
     <div class="seg"><button id="frames">Çerçeveleri gizle</button></div>
+    <div class="lbl">Performans</div>
+    <p class="lbl" id="perf" style="text-transform:none;letter-spacing:0;margin:0;color:var(--neon);font-family:var(--mono)">El takibi yükleniyor</p>
     <div class="lbl">Sahne</div>
     <div class="seg"><button id="clear">Tüm eşyaları sıfırla</button><button class="danger" id="stop">Kamerayı kapat</button></div>
   </div>
@@ -194,7 +198,7 @@ function say(t,ms){const m=$("msg");m.hidden=false;m.textContent=t;clearTimeout(
 let ac,master,recDest=null,beatBus=null;
 function audio(){
   try{if(navigator.audioSession)navigator.audioSession.type="playback"}catch(e){} // plays with the silent switch on (iOS 17+)
-  if(!ac){ac=new (window.AudioContext||window.webkitAudioContext)();
+  if(!ac){const AC=window.AudioContext||window.webkitAudioContext;try{ac=new AC({latencyHint:"interactive"})}catch(e){ac=new AC()}
     const comp=ac.createDynamicsCompressor();comp.threshold.value=-14;comp.ratio.value=4;comp.attack.value=.003;comp.release.value=.2;
     master=ac.createGain();master.gain.value=.9;master.connect(comp);comp.connect(ac.destination);
     try{recDest=ac.createMediaStreamDestination();comp.connect(recDest)}catch(e){}
@@ -403,8 +407,8 @@ function flash(o){addWave(o);const d=els.get(o.id);if(d){d.classList.add("hit");
 // hysteresis: stay on the current object until the tip clearly leaves it
 function point(key,x,y){
   const curId=cur.get(key),curObj=curId&&objs.find(o=>o.id===curId);
-  if(curObj&&inside(curObj,x,y,true)){const inner=hitAt(x,y);if(!inner||inner.id===curId||oArea(inner)>oArea(curObj))return}
-  const o=hitAt(x,y);const id=o?o.id:0;if(id!==curId){cur.set(key,id);if(o){play(o.note);flash(o)}}}
+  if(curObj&&inside(curObj,x,y,true)){const inner=hitAt(x,y);if(!inner||inner.id===curId||oArea(inner)>oArea(curObj))return null}
+  const o=hitAt(x,y);const id=o?o.id:0;if(id!==curId){cur.set(key,id);if(o){play(o.note);flash(o);return o}}return null}
 
 // ---------- full scan ----------
 // One still frame, searched whole and in four overlapping tiles (small things show up better when zoomed in),
@@ -455,19 +459,74 @@ async function keepAwake(){try{if("wakeLock" in navigator&&!document.hidden)wake
 async function makeTask(C,fs,o){try{return await C.createFromOptions(fs,{...o,baseOptions:{...o.baseOptions,delegate:"GPU"}})}catch(e){return await C.createFromOptions(fs,{...o,baseOptions:{...o.baseOptions,delegate:"CPU"}})}}
 async function loadModels(){
   const V=await import(VB+"/vision_bundle.mjs");const fs=await V.FilesetResolver.forVisionTasks(VB+"/wasm");
-  hand=await makeTask(V.HandLandmarker,fs,{baseOptions:{modelAssetPath:HAND_M},runningMode:"VIDEO",numHands:2,minHandDetectionConfidence:.3,minHandPresenceConfidence:.3,minTrackingConfidence:.3});
+  const okW=await startHandWorker();
+  if(!okW)hand=await makeTask(V.HandLandmarker,fs,HAND_OPTS);
+  perfText();
   const dOpt=m=>({baseOptions:{modelAssetPath:m},runningMode:"IMAGE",scoreThreshold:.22,maxResults:25,categoryDenylist:SURFACES});
   try{det=await makeTask(V.ObjectDetector,fs,dOpt(DET_M2));detName="lite2"}catch(e){det=await makeTask(V.ObjectDetector,fs,dOpt(DET_M));detName="lite0"}
   // the outline model is optional: without it objects fall back to rectangles
   try{seg=await makeTask(V.InteractiveSegmenter,fs,{baseOptions:{modelAssetPath:SEG_M},outputCategoryMask:true,outputConfidenceMasks:false})}catch(e){seg=null}
 }
 
+// ================= hand tracking in a background worker =================
+// Hand tracking runs off the main thread, so drawing, sound and object search never hold up the fingertip.
+const WORKER_SRC=`(()=>{const V=self.exports;let hand=null;
+async function mk(o){try{return[await V.HandLandmarker.createFromOptions(fs,{...o,baseOptions:{...o.baseOptions,delegate:"GPU"}}),"GPU"]}catch(e){return[await V.HandLandmarker.createFromOptions(fs,{...o,baseOptions:{...o.baseOptions,delegate:"CPU"}}),"CPU"]}}
+let fs;self.onmessage=async e=>{const d=e.data;
+ if(d.type==="init"){try{fs=await V.FilesetResolver.forVisionTasks("${VB}/wasm");const r=await mk(d.opts);hand=r[0];postMessage({type:"ready",delegate:r[1]})}catch(err){postMessage({type:"error",msg:String(err)})}return}
+ if(d.type==="frame"){const t0=performance.now();let out={type:"hands",ts:d.ts,lm:[],hd:[]};
+   try{const r=hand.detectForVideo(d.bmp,d.ts);out.lm=(r.landmarks||[]).map(l=>l.map(p=>[p.x,p.y]));out.hd=(r.handednesses||r.handedness||[]).map(h=>(h[0]||{}).categoryName||"")}catch(err){out.err=String(err)}
+   try{d.bmp.close()}catch(_){}out.ms=performance.now()-t0;postMessage(out)}}})();`;
+let handW=null,handReady=false,handBusy=false,handDelegate="",handMs=0,handFps=0,fpsN=0,fpsT=0,sentAt=0;
+const HAND_OPTS={baseOptions:{modelAssetPath:HAND_M},runningMode:"VIDEO",numHands:2,minHandDetectionConfidence:.3,minHandPresenceConfidence:.3,minTrackingConfidence:.3};
+async function startHandWorker(){let lib;try{lib=await (await fetch(VB+"/vision_bundle.cjs")).text()}catch(e){return false}
+  return new Promise(res=>{
+  // the library is embedded into the worker itself, so it does not depend on how the CDN labels the file
+  try{handW=new Worker(URL.createObjectURL(new Blob(["self.exports={};\n",lib,"\n;",WORKER_SRC],{type:"text/javascript"})))}catch(e){handW=null;res(false);return}
+  const to=setTimeout(()=>{if(!handReady){try{handW.terminate()}catch(_){}handW=null;res(false)}},20000);
+  handW.onmessage=e=>{const d=e.data;
+    if(d.type==="ready"){handReady=true;handDelegate=d.delegate;clearTimeout(to);res(true)}
+    else if(d.type==="error"){clearTimeout(to);try{handW.terminate()}catch(_){}handW=null;res(false)}
+    else if(d.type==="hands"){handBusy=false;handMs=d.ms;fpsN++;const n=performance.now();if(n-fpsT>1000){handFps=Math.round(fpsN*1000/(n-fpsT));fpsN=0;fpsT=n;perfText()}
+      onHands(d.lm.map(l=>l.map(([x,y])=>({x,y}))),d.hd,n)}};
+  handW.onerror=()=>{clearTimeout(to);handW=null;handReady=false;res(false)};
+  handW.postMessage({type:"init",opts:HAND_OPTS})})}
+const hproc=document.createElement("canvas"),hctx=hproc.getContext("2d");
+async function sendFrame(){const vw=v.videoWidth,vh=v.videoHeight;if(!vw)return;handBusy=true;
+  const w=480,h=Math.round(480*vh/vw);if(hproc.width!==w||hproc.height!==h){hproc.width=w;hproc.height=h}
+  try{hctx.drawImage(v,0,0,w,h);const bmp=await createImageBitmap(hproc);sentAt=performance.now();handW.postMessage({type:"frame",bmp,ts:sentAt},[bmp])}catch(e){handBusy=false}}
+function perfText(){const el=$("perf");if(!el)return;el.textContent=handW&&handReady?`El takibi: ${handFps} kare/sn · ${Math.round(handMs)} ms · ${handDelegate}, arka planda`:hand?`El takibi: ana iş parçacığında (${handFps} kare/sn · ${Math.round(handMs)} ms)`:"El takibi yükleniyor"}
+
+// ================= fingertips → notes =================
+// Two ways to sound an object: the tip moving onto it, or a quick downward strike while over it (for rhythm on one object).
+let playMode=store.get("playMode","both");const strike=new Map();
+function onHands(landmarks,hands,now){
+  const tips=[],ids=fingers==="all"?TIPS_ALL:TIPS_INDEX;
+  landmarks.forEach((lm,h)=>{const side=hands[h]||("h"+h);
+    ids.forEach(t=>{const k=side+t,p=lm[t],prev=tipPos.get(k);let s;
+      if(prev&&now-prev.t<250){const sp=Math.hypot(p.x-prev.x,p.y-prev.y),a=Math.min(1,.5+sp*30);
+        s={x:prev.x+(p.x-prev.x)*a,y:prev.y+(p.y-prev.y)*a,t:now,vy:.6*(p.y-prev.y)/Math.max(.008,(now-prev.t)/1000)+.4*(prev.vy||0)}}
+      else s={x:p.x,y:p.y,t:now,vy:0};
+      tipPos.set(k,s);tips.push({k,x:s.x,y:s.y,vy:s.vy,idx:t===8})})});
+  if(tips.length)lastHand=now;
+  tips.forEach(t=>{
+    const enterHit=playMode!=="strike"?point(t.k,t.x,t.y):(trackOnly(t.k,t.x,t.y),null);
+    if(playMode==="enter")return;
+    const st=strike.get(t.k)||{armed:true,last:0};if(enterHit)st.last=now;
+    if(st.armed&&t.vy>.4){st.armed=false;const o=hitAt(t.x,t.y,true);
+      // one stroke = one note: skip if this finger just sounded something
+      if(o&&now-st.last>200){play(o.note);flash(o);st.last=now}}
+    else if(!st.armed&&t.vy<.06)st.armed=true;
+    strike.set(t.k,st)});
+  drawTips(tips,now)}
+function trackOnly(key,x,y){const o=hitAt(x,y);cur.set(key,o?o.id:0)}
+
 // The models work on small images internally, so hand them a 640px copy instead of the full 1080p frame.
 const proc=document.createElement("canvas"),procCtx=proc.getContext("2d",{willReadFrequently:false});let procT=-1;
 function procFrame(){const vw=v.videoWidth,vh=v.videoHeight;if(!vw)return v;const w=640,h=Math.round(640*vh/vw);
   if(proc.width!==w||proc.height!==h){proc.width=w;proc.height=h}
   if(procT!==v.currentTime){procCtx.drawImage(v,0,0,w,h);procT=v.currentTime}return proc}
-function setStatus(){const s=$("status");const holding=!locked&&performance.now()-lastHand<1200;
+function setStatus(){const s=$("status");const holding=!locked&&performance.now()-lastHand<1500;
   s.className="status"+(locked?"":holding?" hold":" live");s.title=locked?"Kilitli":holding?"El görünüyor, çerçeveler bekliyor":"Eşyalar aranıyor"}
 
 function loop(){
@@ -476,27 +535,18 @@ function loop(){
     if(!camOn)return;fit();
     if(v.readyState>=2&&v.currentTime!==lastT){
       lastT=v.currentTime;const now=performance.now();
-      if(hand){try{
-        const src=procFrame();const r=hand.detectForVideo(src,now);const tips=[];const ids=fingers==="all"?TIPS_ALL:TIPS_INDEX;
-        (r.landmarks||[]).forEach((lm,h)=>{
-          // key by left/right hand so the two hands never swap identities between frames
-          const side=((r.handednesses||r.handedness||[])[h]||[{}])[0].categoryName||("h"+h);
-          ids.forEach(t=>{const k=side+t,p=lm[t],prev=tipPos.get(k);let s;
-            if(prev&&now-prev.t<250){
-              // adaptive smoothing: steady when slow, immediate when the finger moves fast
-              const sp=Math.hypot(p.x-prev.x,p.y-prev.y),a=Math.min(1,.42+sp*30);s={x:prev.x+(p.x-prev.x)*a,y:prev.y+(p.y-prev.y)*a,t:now}}
-            else s={x:p.x,y:p.y,t:now};
-            tipPos.set(k,s);tips.push({k,x:s.x,y:s.y,idx:t===8})})});
-        if(tips.length)lastHand=now;
-        tips.forEach(t=>point(t.k,t.x,t.y));drawTips(tips,now);
+      if(handW&&handReady){if(!handBusy||now-sentAt>700)sendFrame()}
+      else if(hand){try{
+        const t0=performance.now(),src=procFrame();const r=hand.detectForVideo(src,now);handMs=performance.now()-t0;fpsN++;if(now-fpsT>1000){handFps=Math.round(fpsN*1000/(now-fpsT));fpsN=0;fpsT=now;perfText()}
+        onHands((r.landmarks||[]),((r.handednesses||r.handedness||[]).map(h=>(h[0]||{}).categoryName||"")),now);
       }catch(e){}}
       // pause object updates while a hand is in view, so a covered object is not lost or moved
-      if(det&&!scanning&&!locked&&!editing&&now-lastHand>1200&&now-lastDet>450){
+      if(det&&!scanning&&!locked&&!editing&&now-lastHand>1500&&now-lastDet>(beating?1500:600)){
         lastDet=now;
         try{const src=procFrame();ingest(nms(detectIn(src),.45),now);
           const next=seg&&objs.find(o=>!o.mask&&!o.segTried&&!o.manual);if(next)refine(next,src);
           render()}catch(e){}
-      }else if(now-lastHand<=1200)objs.forEach(o=>o.seen=now);
+      }else if(now-lastHand<=1500)objs.forEach(o=>o.seen=now);
       setStatus();
     }
     fxFrame(performance.now());
@@ -591,7 +641,7 @@ $("objRemove").onclick=()=>{const o=objs.find(o=>o.id===selId);if(!o)return;
 
 Object.entries(VOICES).forEach(([k,vv])=>{const b=document.createElement("button");b.textContent=vv.name;b.dataset.k=k;b.onclick=()=>{inst=k;store.set("inst",k);segMark();play("E4")};$("instSeg").append(b)});
 [["index","İşaret parmakları"],["all","Tüm parmaklar"]].forEach(([k,n])=>{const b=document.createElement("button");b.textContent=n;b.dataset.f=k;b.onclick=()=>{fingers=k;store.set("fingers",k);segMark()};$("fingSeg").append(b)});
-function segMark(){[...$("scaleSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.s===scaleKey));[...$("styleSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.st===styleKey));[...$("instSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.k===inst));[...$("fingSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.f===fingers))}
+function segMark(){[...$("modeSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.m===playMode));[...$("scaleSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.s===scaleKey));[...$("styleSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.st===styleKey));[...$("instSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.k===inst));[...$("fingSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.f===fingers))}
 segMark();
 $("beat").onclick=()=>{beating?stopBeat():startBeat()};
 $("scan").onclick=()=>{if(!det){say("Tanıma hâlâ yükleniyor, birkaç saniye sonra tekrar dene.",3000);return}scan()};
@@ -599,6 +649,8 @@ Object.entries(SCALES).forEach(([k,x])=>{const b=document.createElement("button"
   const S=curScale();[0,1,2].forEach((i,j)=>setTimeout(()=>play(S[3+i]),j*140))};$("scaleSeg").append(b)});
 Object.entries(STYLES).forEach(([k,x])=>{const b=document.createElement("button");b.textContent=x.name;b.dataset.st=k;b.onclick=()=>{styleKey=k;store.set("style",k);bpm=x.bpm;store.set("bpm",bpm);syncRanges();segMark();if(!beating)startBeat()};$("styleSeg").append(b)});
 function syncRanges(){$("tempo").value=bpm;$("tempoVal").textContent=bpm+" BPM";$("beatVol").value=beatVol;$("beatVolVal").textContent=beatVol+"%";$("padBtn").classList.toggle("on",padOn)}
+[["both","Üstüne gelince + vuruş"],["enter","Sadece üstüne gelince"],["strike","Sadece vuruşla"]].forEach(([k,n])=>{const b=document.createElement("button");b.textContent=n;b.dataset.m=k;
+  b.onclick=()=>{playMode=k;store.set("playMode",k);segMark()};$("modeSeg").append(b)});
 $("tempo").oninput=e=>{bpm=+e.target.value;store.set("bpm",bpm);syncRanges()};
 $("beatVol").oninput=e=>{beatVol=+e.target.value;store.set("beatVol",beatVol);if(beatBus)beatBus.gain.value=beatVol/100;syncRanges()};
 $("padBtn").onclick=()=>{padOn=!padOn;store.set("pad",padOn);syncRanges()};
