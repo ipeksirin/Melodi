@@ -1,4 +1,4 @@
-<!doctype html><html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="apple-mobile-web-app-capable" content="yes"><title>Oda Piyanosu</title>
+<!doctype html><html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"><meta name="apple-mobile-web-app-capable" content="yes"><title>Oda Piyanosu</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Mono:wght@500&display=swap">
 <style>
@@ -10,7 +10,8 @@
   --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
   color-scheme:dark;
 }
-html,body{height:100%;margin:0;overflow:hidden;overscroll-behavior:none}
+html,body{height:100%;margin:0;overflow:hidden;overscroll-behavior:none;touch-action:none;-webkit-text-size-adjust:100%}
+button,input{touch-action:manipulation}
 [hidden]{display:none!important}
 body{background:var(--bg);color:var(--fg);font-family:var(--display);-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
 #stage{position:fixed;inset:0;overflow:hidden;touch-action:none;background:#000}
@@ -63,7 +64,7 @@ button:focus-visible{outline:2px solid var(--neon);outline-offset:2px}
 .sheet .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .sheet .lbl{font-size:.75rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
 .notes{display:grid;grid-template-columns:repeat(auto-fill,minmax(46px,1fr));gap:5px}
-.sheet{max-height:62vh;overflow-y:auto}
+.sheet{max-height:62vh;overflow-y:auto;touch-action:pan-y;-webkit-overflow-scrolling:touch}
 #rec.recording{background:#ff3b30;border-color:#ff3b30;color:#fff;font-variant-numeric:tabular-nums}
 #rec .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#ff3b30;margin-right:6px;vertical-align:1px}
 #rec.recording .dot{background:#fff;animation:blink 1s steps(2) infinite}
@@ -323,9 +324,10 @@ function point(key,x,y){
   const o=hitAt(x,y);const id=o?o.id:0;if(id!==curId){cur.set(key,id);if(o){play(o.note);flash(o)}}}
 
 // ================= fingertips =================
-function drawTips(list){
-  const alive=new Set();
-  list.forEach(({k,x,y,idx})=>{alive.add(k);let el=tipEls.get(k);if(!el){el=document.createElement("div");tipsEl.append(el);tipEls.set(k,el)}
+function drawTips(list,now){
+  now=now||performance.now();const alive=new Set();
+  tipPos.forEach((p,k)=>{if(now-p.t<180)alive.add(k)});
+  list.forEach(({k,x,y,idx})=>{let el=tipEls.get(k);if(!el){el=document.createElement("div");tipsEl.append(el);tipEls.set(k,el)}
     el.className="tip"+(idx?" idx":"");el.style.left=x*100+"%";el.style.top=y*100+"%"});
   tipEls.forEach((el,k)=>{if(!alive.has(k)){el.remove();tipEls.delete(k);tipPos.delete(k);cur.delete(k)}});
 }
@@ -341,11 +343,16 @@ async function keepAwake(){try{if("wakeLock" in navigator&&!document.hidden)wake
 async function makeTask(C,fs,o){try{return await C.createFromOptions(fs,{...o,baseOptions:{...o.baseOptions,delegate:"GPU"}})}catch(e){return await C.createFromOptions(fs,{...o,baseOptions:{...o.baseOptions,delegate:"CPU"}})}}
 async function loadModels(){
   const V=await import(VB+"/vision_bundle.mjs");const fs=await V.FilesetResolver.forVisionTasks(VB+"/wasm");
-  hand=await makeTask(V.HandLandmarker,fs,{baseOptions:{modelAssetPath:HAND_M},runningMode:"VIDEO",numHands:2,minHandDetectionConfidence:.35,minHandPresenceConfidence:.35,minTrackingConfidence:.35});
+  hand=await makeTask(V.HandLandmarker,fs,{baseOptions:{modelAssetPath:HAND_M},runningMode:"VIDEO",numHands:2,minHandDetectionConfidence:.3,minHandPresenceConfidence:.3,minTrackingConfidence:.3});
   det=await makeTask(V.ObjectDetector,fs,{baseOptions:{modelAssetPath:DET_M},runningMode:"VIDEO",scoreThreshold:.28,maxResults:20,categoryDenylist:SURFACES});
 }
 
-function setStatus(){const s=$("status");const holding=!locked&&performance.now()-lastHand<900;
+// The models work on small images internally, so hand them a 640px copy instead of the full 1080p frame.
+const proc=document.createElement("canvas"),procCtx=proc.getContext("2d",{willReadFrequently:false});let procT=-1;
+function procFrame(){const vw=v.videoWidth,vh=v.videoHeight;if(!vw)return v;const w=640,h=Math.round(640*vh/vw);
+  if(proc.width!==w||proc.height!==h){proc.width=w;proc.height=h}
+  if(procT!==v.currentTime){procCtx.drawImage(v,0,0,w,h);procT=v.currentTime}return proc}
+function setStatus(){const s=$("status");const holding=!locked&&performance.now()-lastHand<1200;
   s.className="status"+(locked?"":holding?" hold":" live");s.title=locked?"Kilitli":holding?"El görünüyor, çerçeveler bekliyor":"Eşyalar aranıyor"}
 
 function loop(){
@@ -355,19 +362,26 @@ function loop(){
     if(v.readyState>=2&&v.currentTime!==lastT){
       lastT=v.currentTime;const now=performance.now();
       if(hand){try{
-        const r=hand.detectForVideo(v,now);const tips=[];const ids=fingers==="all"?TIPS_ALL:TIPS_INDEX;
-        (r.landmarks||[]).forEach((lm,h)=>ids.forEach(t=>{const k="h"+h+"t"+t,p=lm[t];const prev=tipPos.get(k);
-          const s=prev?{x:prev.x+(p.x-prev.x)*.75,y:prev.y+(p.y-prev.y)*.75}:{x:p.x,y:p.y};tipPos.set(k,s);tips.push({k,x:s.x,y:s.y,idx:t===8})}));
+        const src=procFrame();const r=hand.detectForVideo(src,now);const tips=[];const ids=fingers==="all"?TIPS_ALL:TIPS_INDEX;
+        (r.landmarks||[]).forEach((lm,h)=>{
+          // key by left/right hand so the two hands never swap identities between frames
+          const side=((r.handednesses||r.handedness||[])[h]||[{}])[0].categoryName||("h"+h);
+          ids.forEach(t=>{const k=side+t,p=lm[t],prev=tipPos.get(k);let s;
+            if(prev&&now-prev.t<250){
+              // adaptive smoothing: steady when slow, immediate when the finger moves fast
+              const sp=Math.hypot(p.x-prev.x,p.y-prev.y),a=Math.min(1,.42+sp*30);s={x:prev.x+(p.x-prev.x)*a,y:prev.y+(p.y-prev.y)*a,t:now}}
+            else s={x:p.x,y:p.y,t:now};
+            tipPos.set(k,s);tips.push({k,x:s.x,y:s.y,idx:t===8})})});
         if(tips.length)lastHand=now;
-        tips.forEach(t=>point(t.k,t.x,t.y));drawTips(tips);
+        tips.forEach(t=>point(t.k,t.x,t.y));drawTips(tips,now);
       }catch(e){}}
       // pause object updates while a hand is in view, so a covered object is not lost or moved
-      if(det&&!locked&&!editing&&now-lastHand>900&&now-lastDet>300){
+      if(det&&!locked&&!editing&&now-lastHand>1200&&now-lastDet>450){
         lastDet=now;
-        try{const r=det.detectForVideo(v,now+.5);const W=v.videoWidth,H=v.videoHeight;
+        try{const src=procFrame(),r=det.detectForVideo(src,now+.5);const W=src.width,H=src.height;
           ingest((r.detections||[]).map(x=>({x:x.boundingBox.originX/W,y:x.boundingBox.originY/H,w:x.boundingBox.width/W,h:x.boundingBox.height/H})),now);render();
         }catch(e){}
-      }else if(now-lastHand<=900)objs.forEach(o=>o.seen=now);
+      }else if(now-lastHand<=1200)objs.forEach(o=>o.seen=now);
       setStatus();
     }
     fxFrame(performance.now());
@@ -472,23 +486,37 @@ syncRanges();segMark();
 $("frames").onclick=()=>{const c=document.body.classList.toggle("off");$("frames").textContent=c?"Çerçeveleri göster":"Çerçeveleri gizle"};
 $("clear").onclick=()=>{objs=[];ignored=[];render();$("now").textContent="";closeSheets();say("Sıfırlandı. Eşyalar yeniden aranıyor.",2500);if(locked)$("lock").click()};
 $("stop").onclick=()=>{stopRec();stopBeat();camOn=false;cancelAnimationFrame(raf);if(stream)stream.getTracks().forEach(t=>t.stop());stream=null;try{wake&&wake.release()}catch(e){}
-  closeSheets();if(editing)$("edit").click();drawTips([]);$("bar").hidden=true;$("msg").hidden=true;$("start").hidden=false;$("go").disabled=false;$("go").textContent="Kamerayı başlat"};
+  closeSheets();if(editing)$("edit").click();tipPos.clear();drawTips([]);$("bar").hidden=true;$("msg").hidden=true;$("start").hidden=false;$("go").disabled=false;$("go").textContent="Kamerayı başlat"};
+
+// ================= no page zoom =================
+["gesturestart","gesturechange","gestureend"].forEach(ev=>document.addEventListener(ev,e=>e.preventDefault(),{passive:false}));
+document.addEventListener("touchmove",e=>{if(e.touches.length>1)e.preventDefault()},{passive:false});
+let lastTouchEnd=0;document.addEventListener("touchend",e=>{const n=Date.now();if(n-lastTouchEnd<320&&!(e.target.closest&&e.target.closest("input")))e.preventDefault();lastTouchEnd=n},{passive:false});
+document.addEventListener("dblclick",e=>e.preventDefault());
 
 // ================= touch =================
 function rel(e){const r=frame.getBoundingClientRect();return[(e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height]}
-let drag=null;const stage=$("stage");
-stage.addEventListener("pointerdown",e=>{audio();try{stage.setPointerCapture(e.pointerId)}catch(_){}const[x,y]=rel(e);
-  if(editing){drag={x0:x,y0:y,moved:false};return}
-  if(!$("setSheet").hidden)closeSheets();
+let drag=null;const stage=$("stage"),down=new Set();
+const sheetOpen=()=>!$("objSheet").hidden||!$("setSheet").hidden||!$("recSheet").hidden;
+function cancelDraw(){drag=null;$("draft").hidden=true}
+stage.addEventListener("pointerdown",e=>{audio();down.add(e.pointerId);
+  // a second finger means a gesture, never a drawing
+  if(down.size>1){cancelDraw();return}
+  // with a panel open, a touch on the camera only closes the panel
+  if(sheetOpen()){closeSheets();$("recSheet").hidden=true;$("recPreview").pause();drag=null;return}
+  try{stage.setPointerCapture(e.pointerId)}catch(_){}const[x,y]=rel(e);
+  if(editing){drag={x0:x,y0:y,moved:false,id:e.pointerId};return}
   point("p"+e.pointerId,x,y)});
-stage.addEventListener("pointermove",e=>{const[x,y]=rel(e);
-  if(editing&&drag){if(Math.abs(x-drag.x0)+Math.abs(y-drag.y0)>.03){drag.moved=true;const d=$("draft");d.hidden=false;
+stage.addEventListener("pointermove",e=>{if(down.size>1)return;const[x,y]=rel(e);
+  if(editing){if(!drag||drag.id!==e.pointerId)return;if(Math.abs(x-drag.x0)+Math.abs(y-drag.y0)>.04){drag.moved=true;const d=$("draft");d.hidden=false;
     Object.assign(d.style,{left:Math.min(x,drag.x0)*100+"%",top:Math.min(y,drag.y0)*100+"%",width:Math.abs(x-drag.x0)*100+"%",height:Math.abs(y-drag.y0)*100+"%"})}return}
-  if(!editing&&e.buttons)point("p"+e.pointerId,x,y)});
-function endPtr(e){cur.delete("p"+e.pointerId);if(!editing||!drag)return;const[x,y]=rel(e);$("draft").hidden=true;const dr=drag;drag=null;
+  if(e.buttons&&down.has(e.pointerId))point("p"+e.pointerId,x,y)});
+function endPtr(e){const wasMulti=down.size>1;down.delete(e.pointerId);cur.delete("p"+e.pointerId);
+  if(!editing||!drag||drag.id!==e.pointerId||wasMulti||e.type==="pointercancel"){if(drag&&drag.id===e.pointerId)cancelDraw();return}
+  const[x,y]=rel(e);const dr=drag;cancelDraw();
   if(dr.moved){const b={x:Math.min(x,dr.x0),y:Math.min(y,dr.y0),w:Math.abs(x-dr.x0),h:Math.abs(y-dr.y0)};
-    if(b.w>.03&&b.h>.03){const o=addObj(b,true);if(o){selId=o.id;render();play(o.note);$("objSheet").hidden=false;$("setSheet").hidden=true;markNote()}}return}
-  const o=hitAt(dr.x0,dr.y0,.01);if(o){selId=o.id;$("objSheet").hidden=false;$("setSheet").hidden=true;$("msg").hidden=true;markNote();play(o.note)}else closeSheets();render()}
-stage.addEventListener("pointerup",endPtr);stage.addEventListener("pointercancel",e=>{cur.delete("p"+e.pointerId);drag=null;$("draft").hidden=true});
+    if(b.w>.04&&b.h>.04){const o=addObj(b,true);if(o){selId=o.id;render();play(o.note);$("objSheet").hidden=false;$("setSheet").hidden=true;markNote()}}return}
+  const o=hitAt(dr.x0,dr.y0,.01);if(o){selId=o.id;$("objSheet").hidden=false;$("setSheet").hidden=true;$("msg").hidden=true;markNote();play(o.note);render()}}
+stage.addEventListener("pointerup",endPtr);stage.addEventListener("pointercancel",endPtr);
 </script>
 </body></html>
