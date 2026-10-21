@@ -215,9 +215,32 @@ const VOICES={
     partials(c,t,f,[[1,.5,1],[2,.25,.7],[3,.12,.5],[4,.06,.4],[5,.03,.3],[1.003,.2,1]],2.4,lp,"triangle")}},
   marimba:{name:"Marimba",play(c,t,f,out){partials(c,t,f,[[1,.6,1],[3.9,.18,.25],[9.2,.05,.1]],1.1,out)}},
   bell:{name:"Çan",play(c,t,f,out){partials(c,t,f*2,[[1,.35,1],[2.76,.18,.6],[5.4,.1,.4],[8.9,.05,.25]],3.2,out)}},
+  hang:{name:"Hang drum",play(c,t,f,out){
+    // handpan: warm fundamental with a tiny pitch settle, octave and compound-fifth overtones, soft hand thump
+    const lp=c.createBiquadFilter();lp.type="lowpass";lp.frequency.value=Math.min(f*7,6000);lp.connect(out);
+    [[1,.55,3.4],[2,.22,2.2],[3,.08,1.4],[4.02,.03,.8]].forEach(([r,a,d])=>{const o=c.createOscillator(),g=c.createGain();o.type="sine";
+      o.frequency.setValueAtTime(f*r*1.012,t);o.frequency.exponentialRampToValueAtTime(f*r,t+.06);
+      g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(a,t+.012);g.gain.exponentialRampToValueAtTime(.0001,t+d);o.connect(g);g.connect(lp);o.start(t);o.stop(t+d+.05)});
+    const n=c.createBufferSource();n.buffer=noise(c);const nf=c.createBiquadFilter();nf.type="lowpass";nf.frequency.value=f*2.5;const ng=c.createGain();
+    ng.gain.setValueAtTime(.18,t);ng.gain.exponentialRampToValueAtTime(.0001,t+.07);n.connect(nf);nf.connect(ng);ng.connect(out);n.start(t);n.stop(t+.1)}},
+  guitar:{name:"Elektro gitar",play(c,t,f,out){
+    // plucked string (Karplus–Strong, rendered once per note) into a soft overdrive and a speaker-like filter
+    const src=c.createBufferSource();src.buffer=pluck(c,f);
+    const pre=c.createGain();pre.gain.value=2.2;const ws=c.createWaveShaper();ws.curve=driveCurve();ws.oversample="2x";
+    const cab=c.createBiquadFilter();cab.type="lowpass";cab.frequency.value=3600;cab.Q.value=.8;
+    const mid=c.createBiquadFilter();mid.type="peaking";mid.frequency.value=900;mid.gain.value=4;
+    const g=c.createGain();g.gain.value=.32;src.connect(pre);pre.connect(ws);ws.connect(mid);mid.connect(cab);cab.connect(g);g.connect(out);src.start(t)}},
   synth:{name:"Synth",play(c,t,f,out){const lp=c.createBiquadFilter();lp.type="lowpass";lp.Q.value=6;lp.frequency.setValueAtTime(f*14,t);lp.frequency.exponentialRampToValueAtTime(f*1.5,t+.6);lp.connect(out);
     partials(c,t,f,[[1,.22,1],[1.006,.22,1],[.5,.15,.8]],1.3,lp,"sawtooth")}}
 };
+const pluckCache=new Map();
+function pluck(c,f){const key=Math.round(f*100);if(pluckCache.has(key))return pluckCache.get(key);
+  const sr=c.sampleRate,len=Math.floor(sr*2.6),buf=c.createBuffer(1,len,sr),d=buf.getChannelData(0),N=Math.max(2,Math.round(sr/f)),ring=new Float32Array(N);
+  for(let i=0;i<N;i++)ring[i]=(Math.random()*2-1)*(.6+.4*Math.sin(Math.PI*i/N)); // pick near the middle: rounder tone
+  let p=0,last=0;const damp=f>500?.993:.996;
+  for(let i=0;i<len;i++){const nx=(p+1)%N,v=(ring[p]+ring[nx])*.5*damp;d[i]=ring[p];ring[p]=v*.7+last*.3;last=v;p=nx}
+  pluckCache.set(key,buf);return buf}
+let _drive=null;function driveCurve(){if(_drive)return _drive;const n=1024,cv=new Float32Array(n);for(let i=0;i<n;i++){const x=i/(n-1)*2-1;cv[i]=Math.tanh(x*2.6)/Math.tanh(2.6)}return _drive=cv}
 function play(note,at){const c=audio(),t=Math.max(c.currentTime+.005,at||0);const out=c.createGain();out.gain.value=.55;out.connect(master);VOICES[inst].play(c,t,freq(note),out);setTimeout(()=>out.disconnect(),4000)}
 
 // ================= rhythm =================
@@ -523,8 +546,8 @@ function onHands(landmarks,hands,now){
     const st=strike.get(t.k)||{armed:true,last:0};if(enterHit)st.last=now;
     if(st.armed&&t.vy>.4){st.armed=false;const o=hitAt(t.x,t.y,true);
       // one stroke = one note: skip if this finger just sounded something
-      if(o&&now-st.last>200){strikeObj(o);st.last=now}}
-    else if(!st.armed&&t.vy<.06)st.armed=true;
+      if(o&&now-st.last>120){strikeObj(o);st.last=now}}
+    else if(!st.armed&&t.vy<.15)st.armed=true;
     strike.set(t.k,st)});
   drawTips(tips,now)}
 function trackOnly(key,x,y){const o=hitAt(x,y);cur.set(key,o?o.id:0)}
