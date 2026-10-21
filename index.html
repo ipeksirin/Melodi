@@ -23,6 +23,9 @@ body{background:var(--bg);color:var(--fg);font-family:var(--display);-webkit-use
   box-shadow:0 0 10px var(--neon-soft),inset 0 0 10px var(--neon-soft);
   transition:left .25s linear,top .25s linear,width .25s linear,height .25s linear,background .35s,box-shadow .35s}
 .z.manual{border-style:dashed}
+.z.shape,.z.shape.hit{border-color:transparent;box-shadow:none;background:none}
+.z.shape.sel{border-color:#fff;box-shadow:0 0 0 9999px rgba(0,0,0,.35)}
+#scan.busy{opacity:.8}
 .z.hit{border-color:var(--neon);background:rgba(57,255,122,.32);box-shadow:0 0 30px var(--neon),0 0 70px var(--neon-soft),inset 0 0 22px var(--neon);transition:left .25s linear,top .25s linear,width .25s linear,height .25s linear}
 .z.sel{border-color:#fff;border-style:dashed;box-shadow:0 0 0 9999px rgba(0,0,0,.35)}
 .z b{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);font:500 .8rem var(--mono);color:#04140a;background:var(--neon);padding:2px 6px;border-radius:6px;opacity:0;transition:opacity .5s}
@@ -100,6 +103,7 @@ input[type=range]{width:100%;accent-color:var(--neon)}
 <div class="top" id="bar" hidden>
   <button id="rec"><span class="dot"></span><span id="recTxt">Kaydet</span></button>
   <button id="beat">▶ Ritim</button>
+  <button id="scan">Tara</button>
   <button id="lock">Kilitle</button>
   <button id="edit">Düzenle</button>
   <button id="setBtn" aria-label="Ayarlar">⚙︎</button>
@@ -168,9 +172,11 @@ let scaleKey=null;
 const curScale=()=>SCALES[scaleKey].notes;
 const VB="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 const HAND_M="https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+const DET_M2="https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/float16/latest/efficientdet_lite2.tflite";
 const DET_M="https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite";
+const SEG_M="https://storage.googleapis.com/mediapipe-models/interactive_segmenter/magic_touch/float32/1/magic_touch.tflite";
 // Surfaces that hold other things; never treat these as keys
-const SURFACES=["person","dining table","bed","couch","bench","toilet","refrigerator","oven","sink"];
+const SURFACES=["person"]; // tables, shelves etc. are dropped only when they hold other things (see clean())
 const TIPS_INDEX=[8],TIPS_ALL=[4,8,12,16,20];
 const $=id=>document.getElementById(id);
 const v=$("video"),frame=$("frame"),zonesEl=$("zones"),tipsEl=$("tips");
@@ -179,7 +185,7 @@ const store={get(k,d){try{const x=localStorage.getItem("op_"+k);return x==null?d
 let inst=store.get("inst","piano"),fingers=store.get("fingers","index");
 scaleKey=store.get("scale","major");if(!SCALES[scaleKey])scaleKey="major";
 
-let objs=[],ignored=[],nextId=1,locked=false,editing=false,camOn=false,stream=null,hand=null,det=null,raf=0,lastT=-1,lastDet=0,lastHand=0,wake=null,msgTimer,selId=0;
+let seg=null,detName="",scanning=false,objs=[],ignored=[],nextId=1,locked=false,editing=false,camOn=false,stream=null,hand=null,det=null,raf=0,lastT=-1,lastDet=0,lastHand=0,wake=null,msgTimer,selId=0;
 const cur=new Map(),els=new Map(),tipEls=new Map(),tipPos=new Map();
 
 function say(t,ms){const m=$("msg");m.hidden=false;m.textContent=t;clearTimeout(msgTimer);if(ms)msgTimer=setTimeout(()=>{m.hidden=true},ms)}
@@ -277,51 +283,157 @@ function drawWaves(ctx,ox,oy,fw,fh,now){
   ctx.restore();
   // keep transforms clean for the caller
 }
-function fxFrame(now){fxc.clearRect(0,0,fxW,fxH);if(!waves.length)return;waves=waves.filter(w=>now-w.born<w.dur);drawWaves(fxc,0,0,fxW,fxH,now)}
+function fxFrame(now){fxc.clearRect(0,0,fxW,fxH);drawShapes(fxc,0,0,fxW,fxH);if(!waves.length)return;waves=waves.filter(w=>now-w.born<w.dur);drawWaves(fxc,0,0,fxW,fxH,now)}
 
 // ================= objects =================
+// Each object has a screen box (x,y,w,h, 0–1 of the camera frame). When the outline model found its exact shape,
+// it also has `mask` (the object's silhouette inside the box) and `raw` (the detector's looser box, used for tracking).
 const area=b=>b.w*b.h;
+const oArea=o=>area(o)*(o.mask?o.mask.fill:1);
 function iou(a,b){const x1=Math.max(a.x,b.x),y1=Math.max(a.y,b.y),x2=Math.min(a.x+a.w,b.x+b.w),y2=Math.min(a.y+a.h,b.y+b.h);
   const i=Math.max(0,x2-x1)*Math.max(0,y2-y1);return i/(area(a)+area(b)-i||1)}
 const centerIn=(a,b)=>{const cx=a.x+a.w/2,cy=a.y+a.h/2;return cx>b.x&&cx<b.x+b.w&&cy>b.y&&cy<b.y+b.h};
+const track=o=>o.raw||o;
 function pickNote(cx){const S=curScale(),used=new Set(objs.map(o=>o.note));const want=Math.round(Math.min(1,Math.max(0,cx))*(S.length-1));
   for(let d=0;d<=2;d++)for(const i of [want+d,want-d])if(i>=0&&i<S.length&&!used.has(S[i]))return S[i];return S[want]}
 function reassign(){const order=[...objs].sort((a,b)=>(a.x+a.w/2)-(b.x+b.w/2));objs.forEach(o=>o.note=null);order.forEach(o=>o.note=pickNote(o.x+o.w/2));render()}
-function addObj(b,manual){if(objs.length>=24)return null;const o={id:nextId++,x:b.x,y:b.y,w:b.w,h:b.h,note:pickNote(b.x+b.w/2),seen:performance.now(),manual:!!manual};objs.push(o);return o}
+function addObj(b,manual){if(objs.length>=24)return null;const o={id:nextId++,x:b.x,y:b.y,w:b.w,h:b.h,raw:null,mask:null,note:pickNote(b.x+b.w/2),seen:performance.now(),manual:!!manual};objs.push(o);return o}
 
 function clean(dets){
-  // drop huge regions and anything that mostly contains other detections (tables, floors, shelves)
-  let d=dets.filter(b=>b.w>.025&&b.h>.025&&area(b)<.4);
-  d=d.filter(b=>{const inside=d.filter(o=>o!==b&&centerIn(o,b)&&area(o)<area(b)*.6).length;return !(inside>=2||(inside>=1&&area(b)>.15))});
+  // drop huge regions and anything that mostly contains other detections (tables, floors, shelves holding items)
+  let d=dets.filter(b=>b.w>.02&&b.h>.02&&area(b)<.45);
+  d=d.filter(b=>{const inside=d.filter(o=>o!==b&&centerIn(o,b)&&area(o)<area(b)*.6).length;return !(inside>=2||(inside>=1&&area(b)>.12))});
   // user-removed regions stay removed
   d=d.filter(b=>!ignored.some(g=>iou(g,b)>.3||(centerIn(b,g)&&area(b)>area(g)*.4&&area(b)<area(g)*2.5)));
   return d}
+// non-maximum suppression: one box per object, best score wins
+function nms(list,th){list=[...list].sort((a,b)=>b.s-a.s);const out=[];
+  list.forEach(b=>{if(!out.some(o=>iou(o,b)>th||(centerIn(b,o)&&area(b)<area(o)*.9&&iou(o,b)>.35)))out.push(b)});return out}
+// move a refined object with its detector box
+function follow(o,d,k){const r=track(o),n={x:r.x+(d.x-r.x)*k,y:r.y+(d.y-r.y)*k,w:r.w+(d.w-r.w)*k,h:r.h+(d.h-r.h)*k};
+  if(o.raw){const sx=n.w/r.w,sy=n.h/r.h;o.x=n.x+(o.x-r.x)*sx;o.y=n.y+(o.y-r.y)*sy;o.w*=sx;o.h*=sy;o.raw=n}else Object.assign(o,n)}
 function ingest(raw,now){
   const dets=clean(raw),used=new Set();
   dets.forEach(d=>{
-    let best=null,bi=.2;objs.forEach(o=>{if(used.has(o.id))return;const s=iou(o,d);if(s>bi){bi=s;best=o}});
-    if(best){used.add(best.id);best.seen=now;if(!best.manual){const k=.4;best.x+=(d.x-best.x)*k;best.y+=(d.y-best.y)*k;best.w+=(d.w-best.w)*k;best.h+=(d.h-best.h)*k}}
-    else if(!objs.some(o=>centerIn(d,o)&&iou(o,d)>.1)){const o=addObj(d);if(o)used.add(o.id)}
+    let best=null,bi=.2;objs.forEach(o=>{if(used.has(o.id)||o.manual)return;const s=iou(track(o),d);if(s>bi){bi=s;best=o}});
+    if(best){used.add(best.id);best.seen=now;follow(best,d,.4)}
+    else if(!objs.some(o=>centerIn(d,track(o))&&iou(track(o),d)>.1)){const o=addObj(d);if(o)used.add(o.id)}
   });
   objs=objs.filter(o=>o.manual||now-o.seen<3000);
 }
+
+// ---------- exact outlines ----------
+// Ask the outline model for the object under (x,y) of `src`; returns its tight box and silhouette, or null.
+function segmentAt(src,x,y){
+  if(!seg)return null;let out=null;
+  try{seg.segment(src,{keypoint:{x,y}},res=>{
+    const m=res&&res.categoryMask;if(!m)return;const W=m.width,H=m.height;let a;
+    try{a=m.getAsUint8Array()}catch(e){const f=m.getAsFloat32Array();a=new Uint8Array(f.length);for(let i=0;i<f.length;i++)a[i]=Math.round(f[i]*255)}
+    // the object is whatever label sits under the keypoint (robust to 0/1 vs 0/255 encodings)
+    const kx=Math.min(W-1,Math.max(0,Math.round(x*W))),ky=Math.min(H-1,Math.max(0,Math.round(y*H)));const cnt=new Map();
+    for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++){const px=Math.min(W-1,Math.max(0,kx+dx)),py=Math.min(H-1,Math.max(0,ky+dy));const val=a[py*W+px];cnt.set(val,(cnt.get(val)||0)+1)}
+    const fg=[...cnt.entries()].sort((p,q)=>q[1]-p[1])[0][0];
+    // keep only the connected piece that contains the keypoint
+    let start=ky*W+kx;if(a[start]!==fg){for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++){const px=kx+dx,py=ky+dy;if(px>=0&&py>=0&&px<W&&py<H&&a[py*W+px]===fg)start=py*W+px}}
+    const seen=new Uint8Array(W*H),st=[start];let minX=W,minY=H,maxX=-1,maxY=-1,n=0;
+    while(st.length){const p=st.pop();if(seen[p]||a[p]!==fg)continue;seen[p]=1;n++;const px=p%W,py=(p/W)|0;
+      if(px<minX)minX=px;if(px>maxX)maxX=px;if(py<minY)minY=py;if(py>maxY)maxY=py;
+      if(px>0)st.push(p-1);if(px<W-1)st.push(p+1);if(py>0)st.push(p-W);if(py<H-1)st.push(p+W)}
+    const frac=n/(W*H);if(n<12||frac>.45)return;
+    const bw=maxX-minX+1,bh=maxY-minY+1,sc=Math.min(1,96/Math.max(bw,bh)),mw=Math.max(2,Math.round(bw*sc)),mh=Math.max(2,Math.round(bh*sc));
+    const data=new Uint8Array(mw*mh);let on=0;
+    for(let yy=0;yy<mh;yy++)for(let xx=0;xx<mw;xx++){const x0=minX+Math.floor(xx/sc),y0=minY+Math.floor(yy/sc),x1=Math.min(maxX,minX+Math.floor((xx+1)/sc)),y1=Math.min(maxY,minY+Math.floor((yy+1)/sc));
+      let hit=0;for(let py=y0;py<=Math.max(y0,y1-1)&&!hit;py++)for(let px=x0;px<=Math.max(x0,x1-1);px++)if(seen[py*W+px]){hit=1;break}
+      data[yy*mw+xx]=hit;on+=hit}
+    out={box:{x:minX/W,y:minY/H,w:bw/W,h:bh/H},mask:{w:mw,h:mh,data,fill:on/(mw*mh)}};
+  })}catch(e){out=null}
+  return out}
+// Tighten a detected object to its real outline. Rejects results that bleed into the surface around it.
+function refine(o,src){
+  o.segTried=true;const b=track(o),r=segmentAt(src,b.x+b.w/2,b.y+b.h/2);if(!r)return false;
+  const m=r.box;if(area(m)>area(b)*1.35||iou(m,b)<.25)return false;
+  o.raw={x:b.x,y:b.y,w:b.w,h:b.h};Object.assign(o,m);o.mask=r.mask;o.sprite=null;return true}
+function maskAt(o,x,y,rad){const m=o.mask,mx=Math.floor((x-o.x)/o.w*m.w),my=Math.floor((y-o.y)/o.h*m.h);
+  for(let dy=-rad;dy<=rad;dy++)for(let dx=-rad;dx<=rad;dx++){const px=mx+dx,py=my+dy;if(px>=0&&py>=0&&px<m.w&&py<m.h&&m.data[py*m.w+px])return true}return false}
+function inside(o,x,y,pad){const p=pad?.012:0;if(x<o.x-p||x>o.x+o.w+p||y<o.y-p||y>o.y+o.h+p)return false;return !o.mask||maskAt(o,x,y,pad?3:1)}
+
+// Smooth neon outline: trace the silhouette's edge, soften it, and stroke it once into a cached sprite
+function contour(m){const W=m.w+2,H=m.h+2,g=new Uint8Array(W*H);
+  for(let y=0;y<m.h;y++)for(let x=0;x<m.w;x++)g[(y+1)*W+x+1]=m.data[y*m.w+x];
+  let s0=-1;for(let i=0;i<g.length;i++)if(g[i]){s0=i;break}if(s0<0)return[];
+  const D=[[1,0],[1,1],[0,1],[-1,1],[-1,0],[-1,-1],[0,-1],[1,-1]],off=D.map(([dx,dy])=>dy*W+dx);
+  let p=s0,b=4,pts=[],steps=0,max=4*W*H;
+  do{pts.push([p%W-1+.5,((p/W)|0)-1+.5]);let f=-1;
+    for(let k=1;k<=8;k++){const d=(b+k)%8;if(g[p+off[d]]){f=d;break}}
+    if(f<0)break;const bp=p+off[(f+7)%8];p=p+off[f];b=off.findIndex(o=>p+o===bp);if(b<0)b=(f+4)%8;
+  }while(p!==s0&&++steps<max);
+  for(let pass=0;pass<3;pass++){const n=pts.length;if(n<5)break;pts=pts.map((_,i)=>{let x=0,y=0;for(let k=-2;k<=2;k++){const q=pts[(i+k+n)%n];x+=q[0];y+=q[1]}return[x/5,y/5]})}
+  if(pts.length>240){const st=Math.ceil(pts.length/240);pts=pts.filter((_,i)=>i%st===0)}
+  return pts}
+const PAD=28;
+function sprites(o,targetW){const m=o.mask;
+  if(o.sprite&&targetW/o.sprite.tw<1.4&&targetW/o.sprite.tw>.7)return o.sprite;
+  if(!m.pts)m.pts=contour(m);const pts=m.pts,sp=Math.max(1,targetW/m.w),dpr=Math.min(devicePixelRatio||1,2);
+  const path=g=>{g.beginPath();const n=pts.length;if(n<3)return;const P=i=>pts[(i+n)%n],mid=i=>[(P(i)[0]+P(i+1)[0])/2*sp+PAD,(P(i)[1]+P(i+1)[1])/2*sp+PAD];
+    const s0=mid(0);g.moveTo(s0[0],s0[1]);for(let i=1;i<=n;i++){const c=P(i),e=mid(i);g.quadraticCurveTo(c[0]*sp+PAD,c[1]*sp+PAD,e[0],e[1])}g.closePath()};
+  const mk=hit=>{const c=document.createElement("canvas");c.width=Math.ceil(m.w*sp+PAD*2);c.height=Math.ceil(m.h*sp+PAD*2);const g=c.getContext("2d");
+    g.lineJoin="round";path(g);
+    if(hit){g.fillStyle="rgba(57,255,122,.3)";g.fill()}
+    g.shadowColor="#39ff7a";g.shadowBlur=(hit?24:11)*dpr;g.strokeStyle=hit?"#7dffa6":"#39ff7a";g.lineWidth=(hit?3:2)*dpr;
+    g.stroke();if(hit)g.stroke();g.shadowBlur=0;g.lineWidth=(hit?1.4:.8)*dpr;g.strokeStyle="rgba(190,255,210,.7)";g.stroke();return c};
+  o.sprite={idle:mk(false),hit:mk(true),sp,tw:targetW};return o.sprite}
+// draws outlined objects into ctx; (ox,oy,fw,fh) is where the camera frame sits in that ctx
+function drawShapes(ctx,ox,oy,fw,fh){const off=document.body.classList.contains("off");
+  objs.forEach(o=>{if(!o.mask)return;const el=els.get(o.id),hit=!!el&&el.classList.contains("hit");if(off&&!hit&&o.id!==selId)return;
+    const sp=sprites(o,o.w*fxW),img=hit?sp.hit:sp.idle,sx=o.w*fw/(o.mask.w*sp.sp),sy=o.h*fh/(o.mask.h*sp.sp);
+    ctx.drawImage(img,ox+o.x*fw-PAD*sx,oy+o.y*fh-PAD*sy,img.width*sx,img.height*sy)})}
+
 function render(){
   const alive=new Set();
   objs.forEach(o=>{alive.add(o.id);let d=els.get(o.id);
     if(!d){d=document.createElement("div");d.innerHTML="<b></b>";zonesEl.append(d);els.set(o.id,d)}
-    d.className="z"+(o.manual?" manual":"")+(o.id===selId?" sel":"")+(d.classList.contains("hit")?" hit":"");
+    d.className="z"+(o.manual&&!o.mask?" manual":"")+(o.mask?" shape":"")+(o.id===selId?" sel":"")+(d.classList.contains("hit")?" hit":"");
     d.firstChild.textContent=o.note;
     d.style.left=o.x*100+"%";d.style.top=o.y*100+"%";d.style.width=o.w*100+"%";d.style.height=o.h*100+"%"});
   els.forEach((d,id)=>{if(!alive.has(id)){d.remove();els.delete(id)}});
   $("count").textContent=objs.length+" eşya";
 }
-function hitAt(x,y,pad){let best=null,ar=9;objs.forEach(o=>{const p=pad||0;if(x>=o.x-p&&x<=o.x+o.w+p&&y>=o.y-p&&y<=o.y+o.h+p&&area(o)<ar){ar=area(o);best=o}});return best}
+function hitAt(x,y,pad){let best=null,ar=9;objs.forEach(o=>{if(inside(o,x,y,pad)&&oArea(o)<ar){ar=oArea(o);best=o}});return best}
 function flash(o){addWave(o);const d=els.get(o.id);if(d){d.classList.add("hit");clearTimeout(d._t);d._t=setTimeout(()=>d.classList.remove("hit"),300)}$("now").textContent=o.note}
 // hysteresis: stay on the current object until the tip clearly leaves it
 function point(key,x,y){
   const curId=cur.get(key),curObj=curId&&objs.find(o=>o.id===curId);
-  if(curObj&&x>=curObj.x-.012&&x<=curObj.x+curObj.w+.012&&y>=curObj.y-.012&&y<=curObj.y+curObj.h+.012){const inner=hitAt(x,y);if(!inner||inner.id===curId||area(inner)>area(curObj))return}
+  if(curObj&&inside(curObj,x,y,true)){const inner=hitAt(x,y);if(!inner||inner.id===curId||oArea(inner)>oArea(curObj))return}
   const o=hitAt(x,y);const id=o?o.id:0;if(id!==curId){cur.set(key,id);if(o){play(o.note);flash(o)}}}
+
+// ---------- full scan ----------
+// One still frame, searched whole and in four overlapping tiles (small things show up better when zoomed in),
+// then every find is tightened to its outline. Ends locked, so the map holds still while you play.
+const snap=document.createElement("canvas"),tile=document.createElement("canvas");
+function detectIn(src){try{const r=det.detect(src),W=src.width,H=src.height;
+  return (r.detections||[]).map(x=>({x:x.boundingBox.originX/W,y:x.boundingBox.originY/H,w:x.boundingBox.width/W,h:x.boundingBox.height/H,s:(x.categories[0]||{}).score||0}))}catch(e){return[]}}
+const tick=()=>new Promise(r=>setTimeout(r,16));
+async function scan(){
+  if(!det||scanning||!v.videoWidth)return;scanning=true;$("scan").classList.add("busy");$("scan").textContent="Taranıyor…";closeSheets();
+  const vw=v.videoWidth,vh=v.videoHeight;snap.width=1280;snap.height=Math.round(1280*vh/vw);snap.getContext("2d").drawImage(v,0,0,snap.width,snap.height);
+  say("Taranıyor. Telefonu sabit tut.");await tick();
+  let all=detectIn(snap);const T=.6,tiles=[[0,0],[1-T,0],[0,1-T],[1-T,1-T]];
+  for(const [tx,ty] of tiles){await tick();tile.width=640;tile.height=Math.round(640*(snap.height*T)/(snap.width*T));
+    tile.getContext("2d").drawImage(snap,tx*snap.width,ty*snap.height,T*snap.width,T*snap.height,0,0,tile.width,tile.height);
+    detectIn(tile).forEach(b=>{const e=.015;
+      // skip objects cut off by an inner tile edge; the whole-frame pass or another tile sees them whole
+      if((b.x<e&&tx>0)||(b.y<e&&ty>0)||(b.x+b.w>1-e&&tx+T<1)||(b.y+b.h>1-e&&ty+T<1))return;
+      all.push({x:tx+b.x*T,y:ty+b.y*T,w:b.w*T,h:b.h*T,s:b.s})})}
+  const found=clean(nms(all,.45));
+  objs=objs.filter(o=>o.manual);render();
+  let k=0;for(const b of found){const o=addObj(b);if(!o)break;k++;
+    if(seg){say(`Eşyaların sınırları çiziliyor… ${k}/${found.length}`);await tick();refine(o,snap)}
+    o.seen=performance.now()}
+  // outlines that ended up as one object seen twice
+  objs=objs.filter((o,i)=>!objs.some((p,j)=>j<i&&iou(o,p)>.6));
+  reassign();scanning=false;$("scan").classList.remove("busy");$("scan").textContent="Tara";
+  if(!locked)$("lock").click();
+  say(objs.length?`${objs.length} eşya bulundu ve kilitlendi. Eksik bir eşya varsa Düzenle'ye geçip üstüne dokun.`:"Eşya bulunamadı. Daha aydınlık bir açı dene ya da Düzenle'den eşyalara dokunarak ekle.",7000)}
 
 // ================= fingertips =================
 function drawTips(list,now){
@@ -344,7 +456,10 @@ async function makeTask(C,fs,o){try{return await C.createFromOptions(fs,{...o,ba
 async function loadModels(){
   const V=await import(VB+"/vision_bundle.mjs");const fs=await V.FilesetResolver.forVisionTasks(VB+"/wasm");
   hand=await makeTask(V.HandLandmarker,fs,{baseOptions:{modelAssetPath:HAND_M},runningMode:"VIDEO",numHands:2,minHandDetectionConfidence:.3,minHandPresenceConfidence:.3,minTrackingConfidence:.3});
-  det=await makeTask(V.ObjectDetector,fs,{baseOptions:{modelAssetPath:DET_M},runningMode:"VIDEO",scoreThreshold:.28,maxResults:20,categoryDenylist:SURFACES});
+  const dOpt=m=>({baseOptions:{modelAssetPath:m},runningMode:"IMAGE",scoreThreshold:.22,maxResults:25,categoryDenylist:SURFACES});
+  try{det=await makeTask(V.ObjectDetector,fs,dOpt(DET_M2));detName="lite2"}catch(e){det=await makeTask(V.ObjectDetector,fs,dOpt(DET_M));detName="lite0"}
+  // the outline model is optional: without it objects fall back to rectangles
+  try{seg=await makeTask(V.InteractiveSegmenter,fs,{baseOptions:{modelAssetPath:SEG_M},outputCategoryMask:true,outputConfidenceMasks:false})}catch(e){seg=null}
 }
 
 // The models work on small images internally, so hand them a 640px copy instead of the full 1080p frame.
@@ -376,11 +491,11 @@ function loop(){
         tips.forEach(t=>point(t.k,t.x,t.y));drawTips(tips,now);
       }catch(e){}}
       // pause object updates while a hand is in view, so a covered object is not lost or moved
-      if(det&&!locked&&!editing&&now-lastHand>1200&&now-lastDet>450){
+      if(det&&!scanning&&!locked&&!editing&&now-lastHand>1200&&now-lastDet>450){
         lastDet=now;
-        try{const src=procFrame(),r=det.detectForVideo(src,now+.5);const W=src.width,H=src.height;
-          ingest((r.detections||[]).map(x=>({x:x.boundingBox.originX/W,y:x.boundingBox.originY/H,w:x.boundingBox.width/W,h:x.boundingBox.height/H})),now);render();
-        }catch(e){}
+        try{const src=procFrame();ingest(nms(detectIn(src),.45),now);
+          const next=seg&&objs.find(o=>!o.mask&&!o.segTried&&!o.manual);if(next)refine(next,src);
+          render()}catch(e){}
       }else if(now-lastHand<=1200)objs.forEach(o=>o.seen=now);
       setStatus();
     }
@@ -396,7 +511,7 @@ $("go").onclick=async()=>{
     $("err").textContent="Kamera açılamadı. Adres çubuğundaki aA › Web Sitesi Ayarları › Kamera › İzin Ver yolunu izleyip tekrar dene.";return}
   camOn=true;$("start").hidden=true;$("bar").hidden=false;keepAwake();loop();
   if(!det){say("Eşya ve el tanıma yükleniyor…");
-    try{await loadModels();say("Eşyalar bulununca iki elinle de gösterip çalabilirsin. İstemediğin bir çerçeveyi Düzenle'den kaldır.",8000)}
+    try{await loadModels();say("Hazır. Telefonu sabitleyip Tara'ya bas: eşyalar tek tek bulunup sınırları çizilir. İstemediğin bir eşyayı Düzenle'den kaldır.",9000)}
     catch(e){say("Tanıma yüklenemedi. İnternet bağlantını kontrol edip sayfayı yenile.")}}
 };
 
@@ -420,13 +535,17 @@ function drawRec(){
   if(v.readyState>=2)c.drawImage(v,fr.left*s,fr.top*s,fr.width*s,fr.height*s);
   drawWaves(c,fr.left*s,fr.top*s,fr.width*s,fr.height*s,performance.now());
   const off=document.body.classList.contains("off");
-  objs.forEach(o=>{const el=els.get(o.id),hit=el&&el.classList.contains("hit");if(off&&!hit)return;
+  drawShapes(c,fr.left*s,fr.top*s,fr.width*s,fr.height*s);
+  objs.forEach(o=>{if(o.mask)return;const el=els.get(o.id),hit=el&&el.classList.contains("hit");if(off&&!hit)return;
     const x=(fr.left+o.x*fr.width)*s,y=(fr.top+o.y*fr.height)*s,w=o.w*fr.width*s,h=o.h*fr.height*s;
     c.save();c.shadowColor="#39ff7a";c.shadowBlur=(hit?34:12)*s;c.lineWidth=(hit?3:2)*s;c.strokeStyle=hit?"#39ff7a":"rgba(57,255,122,.75)";
     if(o.manual)c.setLineDash([8*s,6*s]);rr(c,x,y,w,h,10*s);
     if(hit){c.fillStyle="rgba(57,255,122,.3)";c.fill()}c.stroke();c.restore();
-    if(hit){c.save();c.font=`500 ${13*s}px "IBM Plex Mono",monospace`;c.textAlign="center";c.textBaseline="middle";const tw=c.measureText(o.note).width+12*s;
-      c.fillStyle="#39ff7a";rr(c,x+w/2-tw/2,y+h/2-10*s,tw,20*s,6*s);c.fill();c.fillStyle="#04140a";c.fillText(o.note,x+w/2,y+h/2+1*s);c.restore()}});
+    if(hit)drawLabel(c,o,x,y,w,h,s)});
+  objs.forEach(o=>{if(!o.mask)return;const el=els.get(o.id);if(!el||!el.classList.contains("hit"))return;
+    drawLabel(c,o,(fr.left+o.x*fr.width)*s,(fr.top+o.y*fr.height)*s,o.w*fr.width*s,o.h*fr.height*s,s)});
+  function drawLabel(c,o,x,y,w,h,s){{c.save();c.font=`500 ${13*s}px "IBM Plex Mono",monospace`;c.textAlign="center";c.textBaseline="middle";const tw=c.measureText(o.note).width+12*s;
+      c.fillStyle="#39ff7a";rr(c,x+w/2-tw/2,y+h/2-10*s,tw,20*s,6*s);c.fill();c.fillStyle="#04140a";c.fillText(o.note,x+w/2,y+h/2+1*s);c.restore()}}
   tipEls.forEach((el,k)=>{const p=tipPos.get(k);if(!p)return;const x=(fr.left+p.x*fr.width)*s,y=(fr.top+p.y*fr.height)*s,r=(el.classList.contains("idx")?15:12)*s;
     c.save();c.shadowColor="#39ff7a";c.shadowBlur=14*s;c.lineWidth=3*s;c.strokeStyle="#39ff7a";c.fillStyle="rgba(57,255,122,.18)";c.beginPath();c.arc(x,y,r,0,7);c.fill();c.stroke();c.restore()});
   c.save();c.font=`700 ${15*s}px "Bricolage Grotesque",sans-serif`;c.fillStyle="rgba(242,245,240,.85)";c.shadowColor="rgba(0,0,0,.6)";c.shadowBlur=6*s;
@@ -459,7 +578,7 @@ function closeSheets(){$("objSheet").hidden=true;$("setSheet").hidden=true;selId
 $("lock").onclick=()=>{locked=!locked;$("lock").classList.toggle("on",locked);$("lock").textContent=locked?"Kilitli":"Kilitle";setStatus();
   say(locked?"Çerçeveler sabit. Kamerayı oynatmadan çal.":"Eşyalar yeniden aranıyor.",3000)};
 $("edit").onclick=()=>{editing=!editing;document.body.classList.toggle("editing",editing);$("edit").classList.toggle("on",editing);$("edit").textContent=editing?"Bitti":"Düzenle";closeSheets();
-  if(editing)say("Bir çerçeveye dokun: notasını değiştir ya da kaldır. Boş bir yere parmağınla kutu çizerek yeni eşya ekle.");else $("msg").hidden=true};
+  if(editing)say("Bir eşyaya dokun: notasını değiştir ya da kaldır. Bulunmamış bir eşyanın üstüne dokunursan sınırlarıyla eklenir; istersen parmağınla kutu da çizebilirsin.");else $("msg").hidden=true};
 $("setBtn").onclick=()=>{const open=$("setSheet").hidden;closeSheets();$("setSheet").hidden=!open;$("msg").hidden=true};
 $("setClose").onclick=closeSheets;$("objClose").onclick=closeSheets;
 
@@ -468,13 +587,14 @@ function buildNoteGrid(){$("noteGrid").innerHTML="";curScale().forEach(n=>{const
   o.note=n;play(n);render();markNote()};$("noteGrid").append(b)})}
 function markNote(){if(!$("noteGrid").children.length)buildNoteGrid();const o=objs.find(o=>o.id===selId);[...$("noteGrid").children].forEach(b=>b.classList.toggle("on",!!o&&b.textContent===o.note))}
 $("objRemove").onclick=()=>{const o=objs.find(o=>o.id===selId);if(!o)return;
-  if(!o.manual)ignored.push({x:o.x,y:o.y,w:o.w,h:o.h});objs=objs.filter(x=>x!==o);closeSheets();say("Kaldırıldı.",1800)};
+  if(!o.manual){const b=track(o);ignored.push({x:b.x,y:b.y,w:b.w,h:b.h})}objs=objs.filter(x=>x!==o);closeSheets();say("Kaldırıldı.",1800)};
 
 Object.entries(VOICES).forEach(([k,vv])=>{const b=document.createElement("button");b.textContent=vv.name;b.dataset.k=k;b.onclick=()=>{inst=k;store.set("inst",k);segMark();play("E4")};$("instSeg").append(b)});
 [["index","İşaret parmakları"],["all","Tüm parmaklar"]].forEach(([k,n])=>{const b=document.createElement("button");b.textContent=n;b.dataset.f=k;b.onclick=()=>{fingers=k;store.set("fingers",k);segMark()};$("fingSeg").append(b)});
 function segMark(){[...$("scaleSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.s===scaleKey));[...$("styleSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.st===styleKey));[...$("instSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.k===inst));[...$("fingSeg").children].forEach(b=>b.classList.toggle("on",b.dataset.f===fingers))}
 segMark();
 $("beat").onclick=()=>{beating?stopBeat():startBeat()};
+$("scan").onclick=()=>{if(!det){say("Tanıma hâlâ yükleniyor, birkaç saniye sonra tekrar dene.",3000);return}scan()};
 Object.entries(SCALES).forEach(([k,x])=>{const b=document.createElement("button");b.textContent=x.name;b.dataset.s=k;b.onclick=()=>{scaleKey=k;store.set("scale",k);reassign();buildNoteGrid();segMark();
   const S=curScale();[0,1,2].forEach((i,j)=>setTimeout(()=>play(S[3+i]),j*140))};$("scaleSeg").append(b)});
 Object.entries(STYLES).forEach(([k,x])=>{const b=document.createElement("button");b.textContent=x.name;b.dataset.st=k;b.onclick=()=>{styleKey=k;store.set("style",k);bpm=x.bpm;store.set("bpm",bpm);syncRanges();segMark();if(!beating)startBeat()};$("styleSeg").append(b)});
@@ -516,7 +636,13 @@ function endPtr(e){const wasMulti=down.size>1;down.delete(e.pointerId);cur.delet
   const[x,y]=rel(e);const dr=drag;cancelDraw();
   if(dr.moved){const b={x:Math.min(x,dr.x0),y:Math.min(y,dr.y0),w:Math.abs(x-dr.x0),h:Math.abs(y-dr.y0)};
     if(b.w>.04&&b.h>.04){const o=addObj(b,true);if(o){selId=o.id;render();play(o.note);$("objSheet").hidden=false;$("setSheet").hidden=true;markNote()}}return}
-  const o=hitAt(dr.x0,dr.y0,.01);if(o){selId=o.id;$("objSheet").hidden=false;$("setSheet").hidden=true;$("msg").hidden=true;markNote();play(o.note);render()}}
+  const o=hitAt(dr.x0,dr.y0,true);if(o){selId=o.id;$("objSheet").hidden=false;$("setSheet").hidden=true;$("msg").hidden=true;markNote();play(o.note);render();return}
+  // empty spot: find the object under the finger and outline it
+  if(!seg){say("Burada eşya yok. Eklemek için parmağınla etrafına kutu çiz.",3500);return}
+  const r=segmentAt(procFrame(),dr.x0,dr.y0);
+  if(!r||area(r.box)<.0006){say("Bu noktada bir eşya ayırt edemedim. Etrafına parmağınla kutu çizebilirsin.",3500);return}
+  const n=addObj(r.box,true);if(!n){say("En fazla 24 eşya olabilir.",3000);return}
+  n.mask=r.mask;selId=n.id;render();play(n.note);flash(n);$("objSheet").hidden=false;$("setSheet").hidden=true;$("msg").hidden=true;markNote()}
 stage.addEventListener("pointerup",endPtr);stage.addEventListener("pointercancel",endPtr);
 </script>
 </body></html>
